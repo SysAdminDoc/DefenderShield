@@ -13,6 +13,9 @@
 
 ---
 
+
+![Screenshot](screenshot.png)
+
 ## Overview
 
 **DefenderShield** is a comprehensive repair tool designed to restore Windows Defender and Windows Firewall after they've been disabled by privacy tools like [privacy.sexy](https://privacy.sexy), O&O ShutUp10, Windows debloaters, or manual registry modifications.
