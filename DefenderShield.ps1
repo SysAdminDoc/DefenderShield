@@ -5,12 +5,13 @@
     Comprehensive repair tool for restoring Windows Defender and Windows Firewall
     after they've been disabled by privacy tools like privacy.sexy, O&O ShutUp10,
     Debloaters, or manual modifications.
-    
-    Features a GUI for selecting which components to repair.
+
+    Features a GUI with pre-scan health dashboard, auto-select broken items,
+    before/after comparison, and Quick Fix All.
 .NOTES
     Author: Generated for Matt
     Requires: Administrator privileges
-    Version: 2.0.0
+    Version: 2.1.0
 #>
 
 # ============================================================================
@@ -63,6 +64,9 @@ $Script:FirewallServices = @(
     @{ Name = 'PolicyAgent'; DisplayName = 'IPsec Policy Agent'; StartType = 'Manual' }
 )
 
+# Stores pre-repair scan results for before/after comparison
+$Script:PreRepairScan = $null
+
 # ============================================================================
 # LOGGING
 # ============================================================================
@@ -73,15 +77,15 @@ function Write-Log {
         [ValidateSet('INFO', 'SUCCESS', 'WARNING', 'ERROR', 'SECTION')]
         [string]$Level = 'INFO'
     )
-    
+
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $logMessage = "[$timestamp] [$Level] $Message"
-    
+
     try {
         Add-Content -Path $Script:Config.LogPath -Value $logMessage -ErrorAction SilentlyContinue
     }
     catch { }
-    
+
     return $logMessage
 }
 
@@ -90,9 +94,9 @@ function Update-Status {
         [string]$Message,
         [string]$Level = 'INFO'
     )
-    
+
     $logMsg = Write-Log -Message $Message -Level $Level
-    
+
     if ($Script:StatusTextBox) {
         try {
             $Script:StatusTextBox.Dispatcher.Invoke([action]{
@@ -103,7 +107,7 @@ function Update-Status {
                     'SECTION' { 'Cyan' }
                     default   { 'White' }
                 }
-                
+
                 $paragraph = New-Object System.Windows.Documents.Paragraph
                 $run = New-Object System.Windows.Documents.Run($Message)
                 $run.Foreground = $color
@@ -118,6 +122,215 @@ function Update-Status {
 }
 
 # ============================================================================
+# HEALTH SCAN FUNCTIONS
+# ============================================================================
+
+function Get-ServiceHealthStatus {
+    param([string]$ServiceName)
+
+    try {
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if (-not $svc) { return 'Missing' }
+
+        $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+        $startType = $null
+        if (Test-Path $regPath) {
+            $startType = (Get-ItemProperty -Path $regPath -Name 'Start' -ErrorAction SilentlyContinue).Start
+        }
+
+        if ($startType -eq 4) { return 'Disabled' }
+        if ($svc.Status -eq 'Running') { return 'Running' }
+        return 'Stopped'
+    }
+    catch {
+        return 'Missing'
+    }
+}
+
+function Get-HealthScan {
+    $scan = @{}
+
+    # Service statuses
+    $scan['WinDefend'] = Get-ServiceHealthStatus 'WinDefend'
+    $scan['SecurityHealthService'] = Get-ServiceHealthStatus 'SecurityHealthService'
+    $scan['wscsvc'] = Get-ServiceHealthStatus 'wscsvc'
+    $scan['MpsSvc'] = Get-ServiceHealthStatus 'mpssvc'
+
+    # Real-time protection
+    try {
+        $mpStatus = Get-MpComputerStatus -ErrorAction SilentlyContinue
+        if ($mpStatus) {
+            $scan['RealTimeProtection'] = if ($mpStatus.RealTimeProtectionEnabled) { 'ON' } else { 'OFF' }
+            $scan['TamperProtection'] = if ($mpStatus.IsTamperProtected) { 'ON' } else { 'OFF' }
+
+            # Definition age
+            $defAge = (New-TimeSpan -Start $mpStatus.AntivirusSignatureLastUpdated -End (Get-Date)).Days
+            $scan['DefinitionAge'] = $defAge
+        }
+        else {
+            $scan['RealTimeProtection'] = 'OFF'
+            $scan['TamperProtection'] = 'OFF'
+            $scan['DefinitionAge'] = -1
+        }
+    }
+    catch {
+        $scan['RealTimeProtection'] = 'OFF'
+        $scan['TamperProtection'] = 'OFF'
+        $scan['DefinitionAge'] = -1
+    }
+
+    # Group Policy blocking
+    $gpBlocking = $false
+    $gpPaths = @(
+        @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'; Name = 'DisableAntiSpyware' },
+        @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'; Name = 'DisableAntiVirus' },
+        @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection'; Name = 'DisableRealtimeMonitoring' }
+    )
+    foreach ($gp in $gpPaths) {
+        try {
+            if (Test-Path $gp.Path) {
+                $val = Get-ItemProperty -Path $gp.Path -Name $gp.Name -ErrorAction SilentlyContinue
+                if ($null -ne $val -and $val.$($gp.Name) -eq 1) {
+                    $gpBlocking = $true
+                    break
+                }
+            }
+        }
+        catch { }
+    }
+    $scan['GroupPolicyBlocking'] = if ($gpBlocking) { 'Yes' } else { 'No' }
+
+    # Windows Security app
+    try {
+        $app = Get-AppxPackage -Name 'Microsoft.SecHealthUI' -ErrorAction SilentlyContinue
+        $scan['WindowsSecurityApp'] = if ($app) { 'Registered' } else { 'Missing' }
+    }
+    catch {
+        $scan['WindowsSecurityApp'] = 'Missing'
+    }
+
+    return $scan
+}
+
+function Get-HealthColor {
+    param([string]$Component, [string]$Value)
+
+    switch ($Component) {
+        'WinDefend'            { if ($Value -eq 'Running') { '#00ff00' } elseif ($Value -eq 'Stopped') { '#ffaa00' } else { '#ff4444' } }
+        'SecurityHealthService' { if ($Value -eq 'Running') { '#00ff00' } elseif ($Value -eq 'Stopped') { '#ffaa00' } else { '#ff4444' } }
+        'wscsvc'               { if ($Value -eq 'Running') { '#00ff00' } elseif ($Value -eq 'Stopped') { '#ffaa00' } else { '#ff4444' } }
+        'MpsSvc'               { if ($Value -eq 'Running') { '#00ff00' } elseif ($Value -eq 'Stopped') { '#ffaa00' } else { '#ff4444' } }
+        'RealTimeProtection'   { if ($Value -eq 'ON') { '#00ff00' } else { '#ff4444' } }
+        'TamperProtection'     { if ($Value -eq 'ON') { '#00ff00' } else { '#ffaa00' } }
+        'DefinitionAge'        {
+            $days = [int]$Value
+            if ($days -lt 0) { '#ff4444' } elseif ($days -le 3) { '#00ff00' } elseif ($days -le 7) { '#ffaa00' } else { '#ff4444' }
+        }
+        'GroupPolicyBlocking'  { if ($Value -eq 'No') { '#00ff00' } else { '#ff4444' } }
+        'WindowsSecurityApp'   { if ($Value -eq 'Registered') { '#00ff00' } else { '#ff4444' } }
+        default { '#ffffff' }
+    }
+}
+
+function Update-HealthDashboard {
+    param([hashtable]$Scan)
+
+    if (-not $Script:DashboardLabels) { return }
+
+    $labelMap = @{
+        'WinDefend'            = @{ Label = 'lblWinDefend'; Value = $Scan['WinDefend'] }
+        'SecurityHealthService' = @{ Label = 'lblSecHealth'; Value = $Scan['SecurityHealthService'] }
+        'wscsvc'               = @{ Label = 'lblWscsvc'; Value = $Scan['wscsvc'] }
+        'MpsSvc'               = @{ Label = 'lblMpsSvc'; Value = $Scan['MpsSvc'] }
+        'RealTimeProtection'   = @{ Label = 'lblRTP'; Value = $Scan['RealTimeProtection'] }
+        'TamperProtection'     = @{ Label = 'lblTamper'; Value = $Scan['TamperProtection'] }
+        'DefinitionAge'        = @{ Label = 'lblDefAge'; Value = if ($Scan['DefinitionAge'] -ge 0) { "$($Scan['DefinitionAge']) days" } else { 'Unknown' } }
+        'GroupPolicyBlocking'  = @{ Label = 'lblGPBlock'; Value = $Scan['GroupPolicyBlocking'] }
+        'WindowsSecurityApp'   = @{ Label = 'lblWinSecApp'; Value = $Scan['WindowsSecurityApp'] }
+    }
+
+    foreach ($key in $labelMap.Keys) {
+        $info = $labelMap[$key]
+        $label = $Script:DashboardLabels[$info.Label]
+        if ($label) {
+            $label.Text = $info.Value
+            $color = Get-HealthColor -Component $key -Value $Scan[$key].ToString()
+            $label.Foreground = $color
+        }
+    }
+}
+
+function Test-DefenderBroken {
+    param([hashtable]$Scan)
+
+    $broken = $false
+    if ($Scan['WinDefend'] -ne 'Running') { $broken = $true }
+    if ($Scan['RealTimeProtection'] -ne 'ON') { $broken = $true }
+    if ($Scan['GroupPolicyBlocking'] -eq 'Yes') { $broken = $true }
+    if ($Scan['SecurityHealthService'] -notin @('Running', 'Stopped')) { $broken = $true }
+    if ($Scan['WindowsSecurityApp'] -ne 'Registered') { $broken = $true }
+    $defAge = $Scan['DefinitionAge']
+    if ($defAge -lt 0 -or $defAge -gt 7) { $broken = $true }
+    return $broken
+}
+
+function Test-FirewallBroken {
+    param([hashtable]$Scan)
+
+    return ($Scan['MpsSvc'] -ne 'Running')
+}
+
+function Get-ComparisonReport {
+    param(
+        [hashtable]$Before,
+        [hashtable]$After
+    )
+
+    $lines = @()
+    $lines += ''
+    $lines += '=== REPAIR RESULTS ==='
+
+    $components = @(
+        @{ Key = 'WinDefend'; Label = 'WinDefend Service' },
+        @{ Key = 'SecurityHealthService'; Label = 'SecurityHealthService' },
+        @{ Key = 'wscsvc'; Label = 'Security Center (wscsvc)' },
+        @{ Key = 'MpsSvc'; Label = 'Firewall (MpsSvc)' },
+        @{ Key = 'RealTimeProtection'; Label = 'Real-Time Protection' },
+        @{ Key = 'TamperProtection'; Label = 'Tamper Protection' },
+        @{ Key = 'GroupPolicyBlocking'; Label = 'Group Policy Blocking' },
+        @{ Key = 'WindowsSecurityApp'; Label = 'Windows Security App' }
+    )
+
+    foreach ($comp in $components) {
+        $bVal = $Before[$comp.Key]
+        $aVal = $After[$comp.Key]
+        $padLabel = $comp.Label.PadRight(26)
+
+        if ($bVal -ne $aVal) {
+            $lines += "$padLabel $bVal -> $aVal [FIXED]"
+        }
+        else {
+            $lines += "$padLabel $aVal -> $aVal [OK - No change needed]"
+        }
+    }
+
+    # Definition age
+    $bDef = $Before['DefinitionAge']
+    $aDef = $After['DefinitionAge']
+    $bDefStr = if ($bDef -ge 0) { "$bDef days" } else { 'Unknown' }
+    $aDefStr = if ($aDef -ge 0) { "$aDef days" } else { 'Unknown' }
+    $padLabel = 'Definition Age'.PadRight(26)
+    if ($bDefStr -ne $aDefStr) {
+        $lines += "$padLabel $bDefStr -> $aDefStr [UPDATED]"
+    }
+    else {
+        $lines += "$padLabel $aDefStr -> $aDefStr [OK - No change needed]"
+    }
+
+    return $lines
+}
+
+# ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
 
@@ -128,7 +341,7 @@ function Set-RegistryValue {
         [object]$Value,
         [string]$Type = 'DWord'
     )
-    
+
     try {
         if (-not (Test-Path $Path)) {
             New-Item -Path $Path -Force -ErrorAction SilentlyContinue | Out-Null
@@ -146,7 +359,7 @@ function Remove-RegistryValue {
         [string]$Path,
         [string]$Name
     )
-    
+
     try {
         if (Test-Path $Path) {
             Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction SilentlyContinue
@@ -164,15 +377,15 @@ function Backup-RegistryKey {
         [string]$KeyPath,
         [string]$BackupName
     )
-    
+
     try {
         if (-not (Test-Path $Script:Config.BackupPath)) {
             New-Item -Path $Script:Config.BackupPath -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
         }
-        
+
         $exportPath = Join-Path $Script:Config.BackupPath "$BackupName.reg"
         $regPath = $KeyPath -replace '^HKLM:\\', 'HKEY_LOCAL_MACHINE\' -replace '^HKCU:\\', 'HKEY_CURRENT_USER\'
-        
+
         $null = reg export $regPath $exportPath /y 2>&1
         return $true
     }
@@ -187,11 +400,11 @@ function Backup-RegistryKey {
 
 function Repair-FirewallServices {
     Update-Status "Repairing Firewall Services..." -Level SECTION
-    
+
     foreach ($svc in $Script:FirewallServices) {
         try {
             $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)"
-            
+
             $startValue = switch ($svc.StartType) {
                 'Automatic' { 2 }
                 'Manual' { 3 }
@@ -200,12 +413,12 @@ function Repair-FirewallServices {
                 'System' { 1 }
                 default { 2 }
             }
-            
+
             if (Test-Path $regPath) {
                 Set-ItemProperty -Path $regPath -Name 'Start' -Value $startValue -Type DWord -Force -ErrorAction SilentlyContinue
                 Update-Status "$($svc.DisplayName): Registry repaired" -Level SUCCESS
             }
-            
+
             # Also try sc.exe
             $null = sc.exe config $svc.Name start= $svc.StartType.ToLower() 2>&1
         }
@@ -217,7 +430,7 @@ function Repair-FirewallServices {
 
 function Repair-FirewallRegistry {
     Update-Status "Removing Firewall Blocking Policies..." -Level SECTION
-    
+
     $policiesToRemove = @(
         'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall',
         'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile',
@@ -225,7 +438,7 @@ function Repair-FirewallRegistry {
         'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile',
         'HKLM:\SOFTWARE\Policies\Microsoft\WindowsFirewall\StandardProfile'
     )
-    
+
     foreach ($policy in $policiesToRemove) {
         try {
             if (Test-Path $policy) {
@@ -237,14 +450,14 @@ function Repair-FirewallRegistry {
             Update-Status "Could not remove: $policy (continuing...)" -Level WARNING
         }
     }
-    
+
     # Reset profile settings
     $profilePaths = @(
         'HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\DomainProfile',
         'HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\PublicProfile',
         'HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\StandardProfile'
     )
-    
+
     foreach ($profilePath in $profilePaths) {
         try {
             if (Test-Path $profilePath) {
@@ -253,22 +466,22 @@ function Repair-FirewallRegistry {
         }
         catch { }
     }
-    
+
     Update-Status "Firewall registry cleanup complete" -Level SUCCESS
 }
 
 function Start-FirewallServices {
     Update-Status "Starting Firewall Services..." -Level SECTION
-    
+
     $startOrder = @('BFE', 'mpssvc', 'IKEEXT', 'PolicyAgent')
-    
+
     foreach ($svcName in $startOrder) {
         try {
             $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
             if ($svc -and $svc.Status -ne 'Running') {
                 Start-Service -Name $svcName -ErrorAction SilentlyContinue
                 Start-Sleep -Milliseconds 500
-                
+
                 $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
                 if ($svc.Status -eq 'Running') {
                     Update-Status "$($svc.DisplayName): Started" -Level SUCCESS
@@ -289,7 +502,7 @@ function Start-FirewallServices {
 
 function Enable-FirewallProfiles {
     Update-Status "Enabling Firewall Profiles..." -Level SECTION
-    
+
     try {
         Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -ErrorAction SilentlyContinue
         Update-Status "All firewall profiles enabled" -Level SUCCESS
@@ -306,7 +519,7 @@ function Enable-FirewallProfiles {
             Update-Status "Could not enable profiles (may need reboot)" -Level WARNING
         }
     }
-    
+
     # Reset to defaults
     try {
         $null = netsh advfirewall reset 2>&1
@@ -321,11 +534,11 @@ function Enable-FirewallProfiles {
 
 function Repair-DefenderServices {
     Update-Status "Repairing Defender Services..." -Level SECTION
-    
+
     foreach ($svc in $Script:DefenderServices) {
         try {
             $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)"
-            
+
             $startValue = switch ($svc.StartType) {
                 'Automatic' { 2 }
                 'Manual' { 3 }
@@ -334,7 +547,7 @@ function Repair-DefenderServices {
                 'System' { 1 }
                 default { 3 }
             }
-            
+
             if (Test-Path $regPath) {
                 Set-ItemProperty -Path $regPath -Name 'Start' -Value $startValue -Type DWord -Force -ErrorAction SilentlyContinue
                 Update-Status "$($svc.DisplayName): Registry repaired" -Level SUCCESS
@@ -344,14 +557,14 @@ function Repair-DefenderServices {
             Update-Status "$($svc.DisplayName): Could not repair (Tamper Protection?)" -Level WARNING
         }
     }
-    
+
     # Repair drivers
     $drivers = @(
         @{ Name = 'WdFilter'; Start = 0 },
         @{ Name = 'WdNisDrv'; Start = 3 },
         @{ Name = 'WdBoot'; Start = 0 }
     )
-    
+
     foreach ($driver in $drivers) {
         try {
             $drvPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($driver.Name)"
@@ -365,11 +578,11 @@ function Repair-DefenderServices {
 
 function Repair-DefenderRegistry {
     Update-Status "Removing Defender Blocking Policies..." -Level SECTION
-    
+
     # Backup first
     Backup-RegistryKey -KeyPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender' -BackupName 'Policies_WindowsDefender'
     Backup-RegistryKey -KeyPath 'HKLM:\SOFTWARE\Microsoft\Windows Defender' -BackupName 'WindowsDefender'
-    
+
     $disablingValues = @(
         @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'; Name = 'DisableAntiSpyware' },
         @{ Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender'; Name = 'DisableAntiVirus' },
@@ -391,7 +604,7 @@ function Repair-DefenderRegistry {
         @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows Defender\Real-Time Protection'; Name = 'DisableScanOnRealtimeEnable' },
         @{ Path = 'HKLM:\SOFTWARE\Microsoft\Windows Defender\Real-Time Protection'; Name = 'DisableIOAVProtection' }
     )
-    
+
     $removed = 0
     foreach ($item in $disablingValues) {
         try {
@@ -411,15 +624,15 @@ function Repair-DefenderRegistry {
             catch { }
         }
     }
-    
+
     Update-Status "Removed/reset $removed blocking policies" -Level SUCCESS
-    
+
     # Remove policy trees
     $policyTrees = @(
         'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Policy Manager',
         'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\UX Configuration'
     )
-    
+
     foreach ($tree in $policyTrees) {
         try {
             if (Test-Path $tree) {
@@ -432,14 +645,14 @@ function Repair-DefenderRegistry {
 
 function Repair-DefenderScheduledTasks {
     Update-Status "Repairing Defender Scheduled Tasks..." -Level SECTION
-    
+
     $defenderTasks = @(
         'Windows Defender Cache Maintenance',
         'Windows Defender Cleanup',
         'Windows Defender Scheduled Scan',
         'Windows Defender Verification'
     )
-    
+
     foreach ($taskName in $defenderTasks) {
         try {
             $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -455,13 +668,13 @@ function Repair-DefenderScheduledTasks {
             Update-Status "Could not enable: $taskName (continuing...)" -Level WARNING
         }
     }
-    
+
     # Remove malicious tasks
     try {
         $suspiciousTasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object {
             $_.TaskName -match 'DisableDefender|DisableWinDefend|KillDefender|StopDefender'
         }
-        
+
         foreach ($task in $suspiciousTasks) {
             try {
                 Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -475,10 +688,10 @@ function Repair-DefenderScheduledTasks {
 
 function Repair-DefenderWMI {
     Update-Status "Checking WMI Subscriptions..." -Level SECTION
-    
+
     try {
         $filters = Get-WmiObject -Query "SELECT * FROM __EventFilter WHERE Name LIKE '%Defender%' OR Name LIKE '%WinDefend%'" -Namespace 'root\subscription' -ErrorAction SilentlyContinue
-        
+
         if ($filters) {
             foreach ($filter in $filters) {
                 try {
@@ -501,7 +714,7 @@ function Repair-DefenderWMI {
 
 function Start-DefenderServices {
     Update-Status "Starting Defender Services..." -Level SECTION
-    
+
     # Start Security Center first
     try {
         $secCenter = Get-Service -Name 'wscsvc' -ErrorAction SilentlyContinue
@@ -511,14 +724,14 @@ function Start-DefenderServices {
         }
     }
     catch { }
-    
+
     foreach ($svc in $Script:DefenderServices) {
         try {
             $service = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
             if ($service -and $service.Status -ne 'Running') {
                 Start-Service -Name $svc.Name -ErrorAction SilentlyContinue
                 Start-Sleep -Milliseconds 300
-                
+
                 $service = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
                 if ($service.Status -eq 'Running') {
                     Update-Status "$($svc.DisplayName): Started" -Level SUCCESS
@@ -539,7 +752,7 @@ function Start-DefenderServices {
 
 function Enable-DefenderFeatures {
     Update-Status "Enabling Defender Protection Features..." -Level SECTION
-    
+
     try {
         Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
         Set-MpPreference -DisableBehaviorMonitoring $false -ErrorAction SilentlyContinue
@@ -552,13 +765,13 @@ function Enable-DefenderFeatures {
         Set-MpPreference -MAPSReporting Advanced -ErrorAction SilentlyContinue
         Set-MpPreference -SubmitSamplesConsent SendAllSamples -ErrorAction SilentlyContinue
         Set-MpPreference -PUAProtection Enabled -ErrorAction SilentlyContinue
-        
+
         Update-Status "Protection features enabled" -Level SUCCESS
     }
     catch {
         Update-Status "Some features could not be enabled (continuing...)" -Level WARNING
     }
-    
+
     # Update signatures
     try {
         Update-Status "Updating virus definitions..."
@@ -572,17 +785,17 @@ function Enable-DefenderFeatures {
 
 function Reset-GroupPolicy {
     Update-Status "Resetting Group Policy..." -Level SECTION
-    
+
     try {
         $machinePolPath = "$env:SystemRoot\System32\GroupPolicy\Machine\Registry.pol"
-        
+
         if (Test-Path $machinePolPath) {
             $backupPol = Join-Path $Script:Config.BackupPath "Registry.pol"
             Copy-Item -Path $machinePolPath -Destination $backupPol -Force -ErrorAction SilentlyContinue
             Remove-Item -Path $machinePolPath -Force -ErrorAction SilentlyContinue
             Update-Status "Machine policy file removed" -Level SUCCESS
         }
-        
+
         $null = gpupdate /force 2>&1
         Update-Status "Group Policy refreshed" -Level SUCCESS
     }
@@ -593,9 +806,9 @@ function Reset-GroupPolicy {
 
 function Repair-WindowsSecurity {
     Update-Status "Repairing Windows Security App..." -Level SECTION
-    
+
     try {
-        Get-AppxPackage -Name 'Microsoft.SecHealthUI' -ErrorAction SilentlyContinue | 
+        Get-AppxPackage -Name 'Microsoft.SecHealthUI' -ErrorAction SilentlyContinue |
             ForEach-Object {
                 Add-AppxPackage -DisableDevelopmentMode -Register "$($_.InstallLocation)\AppXManifest.xml" -ErrorAction SilentlyContinue
             }
@@ -616,12 +829,15 @@ function Start-Repair {
         [bool]$RepairDefender,
         [bool]$CreateRestorePoint
     )
-    
+
     $startTime = Get-Date
-    
-    Update-Status "DefenderShield Repair Started" -Level SECTION
+
+    # Capture pre-repair scan
+    $Script:PreRepairScan = Get-HealthScan
+
+    Update-Status "DefenderShield v2.1.0 Repair Started" -Level SECTION
     Update-Status "Log file: $($Script:Config.LogPath)"
-    
+
     # Create restore point
     if ($CreateRestorePoint) {
         Update-Status "Creating System Restore Point..." -Level SECTION
@@ -634,7 +850,7 @@ function Start-Repair {
             Update-Status "Could not create restore point (continuing...)" -Level WARNING
         }
     }
-    
+
     # Repair Firewall
     if ($RepairFirewall) {
         Update-Status ""
@@ -644,7 +860,7 @@ function Start-Repair {
         Start-FirewallServices
         Enable-FirewallProfiles
     }
-    
+
     # Repair Defender
     if ($RepairDefender) {
         Update-Status ""
@@ -658,17 +874,43 @@ function Start-Repair {
         Enable-DefenderFeatures
         Repair-WindowsSecurity
     }
-    
+
+    # Post-repair scan and comparison
+    Start-Sleep -Seconds 2
+    $postScan = Get-HealthScan
+
+    # Update dashboard with new state
+    Update-HealthDashboard -Scan $postScan
+
+    # Show before/after comparison
+    $comparisonLines = Get-ComparisonReport -Before $Script:PreRepairScan -After $postScan
+
+    Update-Status ""
+    foreach ($line in $comparisonLines) {
+        if ($line -match '\[FIXED\]') {
+            Update-Status $line -Level SUCCESS
+        }
+        elseif ($line -match '\[UPDATED\]') {
+            Update-Status $line -Level SUCCESS
+        }
+        elseif ($line -match '=== REPAIR RESULTS ===') {
+            Update-Status $line -Level SECTION
+        }
+        else {
+            Update-Status $line -Level INFO
+        }
+    }
+
     # Complete
     $duration = (Get-Date) - $startTime
-    
+
     Update-Status ""
     Update-Status "========== REPAIR COMPLETE ==========" -Level SECTION
     Update-Status "Duration: $([math]::Round($duration.TotalSeconds, 1)) seconds" -Level SUCCESS
     Update-Status ""
     Update-Status "A RESTART is strongly recommended!" -Level WARNING
     Update-Status "Check Windows Security after restart." -Level INFO
-    
+
     return $true
 }
 
@@ -680,12 +922,12 @@ function Start-Repair {
 <Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="DefenderShield - Windows Security Repair Tool"
-    Height="650" Width="700"
+    Title="DefenderShield v2.1.0 - Windows Security Repair Tool"
+    Height="850" Width="720"
     WindowStartupLocation="CenterScreen"
     ResizeMode="CanMinimize"
     Background="#1a1a2e">
-    
+
     <Window.Resources>
         <Style TargetType="CheckBox">
             <Setter Property="Foreground" Value="White"/>
@@ -703,43 +945,104 @@ function Start-Repair {
             <Setter Property="Cursor" Value="Hand"/>
         </Style>
     </Window.Resources>
-    
+
     <Grid Margin="20">
         <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
-        
+
         <!-- Header -->
-        <StackPanel Grid.Row="0" Margin="0,0,0,20">
+        <StackPanel Grid.Row="0" Margin="0,0,0,15">
             <TextBlock Text="DefenderShield" FontSize="28" FontWeight="Bold" Foreground="#e94560" HorizontalAlignment="Center"/>
-            <TextBlock Text="Windows Defender and Firewall Repair Tool" FontSize="14" Foreground="#aaa" HorizontalAlignment="Center" Margin="0,5,0,0"/>
+            <TextBlock Text="Windows Defender and Firewall Repair Tool  v2.1.0" FontSize="14" Foreground="#aaa" HorizontalAlignment="Center" Margin="0,5,0,0"/>
         </StackPanel>
-        
+
+        <!-- Health Dashboard -->
+        <Border Grid.Row="1" Background="#16213e" CornerRadius="8" Padding="15" Margin="0,0,0,10">
+            <StackPanel>
+                <TextBlock Text="System Health Dashboard" FontSize="16" FontWeight="SemiBold" Foreground="White" Margin="0,0,0,10"/>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <!-- Left column -->
+                    <StackPanel Grid.Row="0" Grid.Column="0" Orientation="Horizontal" Margin="0,3">
+                        <TextBlock Text="WinDefend:  " Foreground="#aaa" FontFamily="Consolas" FontSize="12"/>
+                        <TextBlock x:Name="lblWinDefend" Text="Scanning..." Foreground="#888" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
+                    </StackPanel>
+                    <StackPanel Grid.Row="1" Grid.Column="0" Orientation="Horizontal" Margin="0,3">
+                        <TextBlock Text="SecurityHealth:  " Foreground="#aaa" FontFamily="Consolas" FontSize="12"/>
+                        <TextBlock x:Name="lblSecHealth" Text="Scanning..." Foreground="#888" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
+                    </StackPanel>
+                    <StackPanel Grid.Row="2" Grid.Column="0" Orientation="Horizontal" Margin="0,3">
+                        <TextBlock Text="Security Center:  " Foreground="#aaa" FontFamily="Consolas" FontSize="12"/>
+                        <TextBlock x:Name="lblWscsvc" Text="Scanning..." Foreground="#888" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
+                    </StackPanel>
+                    <StackPanel Grid.Row="3" Grid.Column="0" Orientation="Horizontal" Margin="0,3">
+                        <TextBlock Text="Firewall (MpsSvc):  " Foreground="#aaa" FontFamily="Consolas" FontSize="12"/>
+                        <TextBlock x:Name="lblMpsSvc" Text="Scanning..." Foreground="#888" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
+                    </StackPanel>
+                    <StackPanel Grid.Row="4" Grid.Column="0" Orientation="Horizontal" Margin="0,3">
+                        <TextBlock Text="Win Security App:  " Foreground="#aaa" FontFamily="Consolas" FontSize="12"/>
+                        <TextBlock x:Name="lblWinSecApp" Text="Scanning..." Foreground="#888" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
+                    </StackPanel>
+
+                    <!-- Right column -->
+                    <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Margin="0,3">
+                        <TextBlock Text="Real-Time Protection:  " Foreground="#aaa" FontFamily="Consolas" FontSize="12"/>
+                        <TextBlock x:Name="lblRTP" Text="Scanning..." Foreground="#888" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
+                    </StackPanel>
+                    <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Margin="0,3">
+                        <TextBlock Text="Tamper Protection:  " Foreground="#aaa" FontFamily="Consolas" FontSize="12"/>
+                        <TextBlock x:Name="lblTamper" Text="Scanning..." Foreground="#888" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
+                    </StackPanel>
+                    <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" Margin="0,3">
+                        <TextBlock Text="Definition Age:  " Foreground="#aaa" FontFamily="Consolas" FontSize="12"/>
+                        <TextBlock x:Name="lblDefAge" Text="Scanning..." Foreground="#888" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
+                    </StackPanel>
+                    <StackPanel Grid.Row="3" Grid.Column="1" Orientation="Horizontal" Margin="0,3">
+                        <TextBlock Text="GP Blocking:  " Foreground="#aaa" FontFamily="Consolas" FontSize="12"/>
+                        <TextBlock x:Name="lblGPBlock" Text="Scanning..." Foreground="#888" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
+                    </StackPanel>
+                </Grid>
+            </StackPanel>
+        </Border>
+
         <!-- Options Panel -->
-        <Border Grid.Row="1" Background="#16213e" CornerRadius="8" Padding="20" Margin="0,0,0,15">
+        <Border Grid.Row="2" Background="#16213e" CornerRadius="8" Padding="20" Margin="0,0,0,10">
             <StackPanel>
                 <TextBlock Text="Select Components to Repair:" FontSize="16" FontWeight="SemiBold" Foreground="White" Margin="0,0,0,15"/>
-                
+
                 <CheckBox x:Name="chkFirewall" IsChecked="True">
                     <StackPanel>
                         <TextBlock Text="Windows Firewall" FontWeight="SemiBold" Foreground="White"/>
                         <TextBlock Text="Repairs services, removes blocking policies, enables all profiles" FontSize="11" Foreground="#888"/>
                     </StackPanel>
                 </CheckBox>
-                
+
                 <CheckBox x:Name="chkDefender" IsChecked="True">
                     <StackPanel>
                         <TextBlock Text="Windows Defender Antivirus" FontWeight="SemiBold" Foreground="White"/>
                         <TextBlock Text="Repairs services, registry, scheduled tasks, WMI, enables protection" FontSize="11" Foreground="#888"/>
                     </StackPanel>
                 </CheckBox>
-                
+
                 <Rectangle Height="1" Fill="#333" Margin="0,10"/>
-                
+
                 <CheckBox x:Name="chkRestorePoint" IsChecked="True">
                     <StackPanel>
                         <TextBlock Text="Create System Restore Point" FontWeight="SemiBold" Foreground="White"/>
@@ -748,21 +1051,21 @@ function Start-Repair {
                 </CheckBox>
             </StackPanel>
         </Border>
-        
+
         <!-- Warning Panel -->
-        <Border Grid.Row="2" Background="#3d1a1a" CornerRadius="8" Padding="15" Margin="0,0,0,15">
+        <Border Grid.Row="3" Background="#3d1a1a" CornerRadius="8" Padding="15" Margin="0,0,0,10">
             <TextBlock TextWrapping="Wrap" Foreground="#ffaa00">
                 <Run FontWeight="SemiBold">Tamper Protection Notice:</Run>
                 <Run>If Defender won't start after repair, disable Tamper Protection in Windows Security (Virus and threat protection - Manage settings), then run this tool again.</Run>
             </TextBlock>
         </Border>
-        
+
         <!-- Status Output -->
-        <Border Grid.Row="3" Background="#0d1117" CornerRadius="8" Padding="10">
-            <RichTextBox x:Name="txtStatus" 
-                         Background="Transparent" 
-                         Foreground="White" 
-                         FontFamily="Consolas" 
+        <Border Grid.Row="4" Background="#0d1117" CornerRadius="8" Padding="10">
+            <RichTextBox x:Name="txtStatus"
+                         Background="Transparent"
+                         Foreground="White"
+                         FontFamily="Consolas"
                          FontSize="12"
                          IsReadOnly="True"
                          BorderThickness="0"
@@ -774,9 +1077,10 @@ function Start-Repair {
                 </FlowDocument>
             </RichTextBox>
         </Border>
-        
+
         <!-- Buttons -->
-        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,15,0,0">
+        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,15,0,0">
+            <Button x:Name="btnQuickFix" Content="Quick Fix All" Margin="0,0,10,0" Width="150" Background="#e94560"/>
             <Button x:Name="btnStart" Content="Start Repair" Margin="0,0,10,0" Width="150"/>
             <Button x:Name="btnRestart" Content="Restart PC" Width="120" Background="#4a1942" IsEnabled="False"/>
         </StackPanel>
@@ -795,45 +1099,86 @@ $chkRestorePoint = $window.FindName('chkRestorePoint')
 $txtStatus = $window.FindName('txtStatus')
 $btnStart = $window.FindName('btnStart')
 $btnRestart = $window.FindName('btnRestart')
+$btnQuickFix = $window.FindName('btnQuickFix')
+
+# Dashboard labels
+$Script:DashboardLabels = @{
+    'lblWinDefend' = $window.FindName('lblWinDefend')
+    'lblSecHealth' = $window.FindName('lblSecHealth')
+    'lblWscsvc'    = $window.FindName('lblWscsvc')
+    'lblMpsSvc'    = $window.FindName('lblMpsSvc')
+    'lblRTP'       = $window.FindName('lblRTP')
+    'lblTamper'    = $window.FindName('lblTamper')
+    'lblDefAge'    = $window.FindName('lblDefAge')
+    'lblGPBlock'   = $window.FindName('lblGPBlock')
+    'lblWinSecApp' = $window.FindName('lblWinSecApp')
+}
 
 # Store reference for logging
 $Script:StatusTextBox = $txtStatus
 
-# Start button click
-$btnStart.Add_Click({
+# Helper to run repair with current checkbox state
+$Script:RunRepair = {
     if (-not $chkFirewall.IsChecked -and -not $chkDefender.IsChecked) {
         [System.Windows.MessageBox]::Show("Please select at least one component to repair.", "DefenderShield", "OK", "Warning") | Out-Null
         return
     }
-    
+
     # Clear status
     $txtStatus.Document.Blocks.Clear()
-    
+
     # Disable controls during repair
     $btnStart.IsEnabled = $false
+    $btnQuickFix.IsEnabled = $false
     $chkFirewall.IsEnabled = $false
     $chkDefender.IsEnabled = $false
     $chkRestorePoint.IsEnabled = $false
     $btnStart.Content = "Repairing..."
-    
+    $btnQuickFix.Content = "Repairing..."
+
     # Store selections
     $repairFW = $chkFirewall.IsChecked
     $repairDef = $chkDefender.IsChecked
     $createRP = $chkRestorePoint.IsChecked
-    
+
     # Process UI events then run repair
     [System.Windows.Forms.Application]::DoEvents()
-    
+
     # Run repair
     Start-Repair -RepairFirewall $repairFW -RepairDefender $repairDef -CreateRestorePoint $createRP
-    
+
     # Re-enable controls
     $btnStart.Content = "Start Repair"
+    $btnQuickFix.Content = "Quick Fix All"
     $btnStart.IsEnabled = $true
+    $btnQuickFix.IsEnabled = $true
     $btnRestart.IsEnabled = $true
     $chkFirewall.IsEnabled = $true
     $chkDefender.IsEnabled = $true
     $chkRestorePoint.IsEnabled = $true
+}
+
+# Start button click
+$btnStart.Add_Click({
+    & $Script:RunRepair
+})
+
+# Quick Fix All button click
+$btnQuickFix.Add_Click({
+    # Select all broken items
+    $scan = Get-HealthScan
+    $chkFirewall.IsChecked = Test-FirewallBroken -Scan $scan
+    $chkDefender.IsChecked = Test-DefenderBroken -Scan $scan
+
+    # If nothing is broken, check both anyway
+    if (-not $chkFirewall.IsChecked -and -not $chkDefender.IsChecked) {
+        $chkFirewall.IsChecked = $true
+        $chkDefender.IsChecked = $true
+    }
+
+    $chkRestorePoint.IsChecked = $true
+
+    & $Script:RunRepair
 })
 
 # Restart button click
@@ -842,6 +1187,41 @@ $btnRestart.Add_Click({
     if ($result -eq 'Yes') {
         Restart-Computer -Force
     }
+})
+
+# Run initial health scan on window load
+$window.Add_ContentRendered({
+    $scan = Get-HealthScan
+    Update-HealthDashboard -Scan $scan
+
+    # Auto-select broken items
+    $defenderBroken = Test-DefenderBroken -Scan $scan
+    $firewallBroken = Test-FirewallBroken -Scan $scan
+
+    $chkDefender.IsChecked = $defenderBroken
+    $chkFirewall.IsChecked = $firewallBroken
+
+    # Update status with scan summary
+    $txtStatus.Document.Blocks.Clear()
+
+    $paragraph = New-Object System.Windows.Documents.Paragraph
+    $run = New-Object System.Windows.Documents.Run("Health scan complete. ")
+    $run.Foreground = '#888'
+    $paragraph.Inlines.Add($run)
+
+    if ($defenderBroken -or $firewallBroken) {
+        $issueRun = New-Object System.Windows.Documents.Run("Issues detected - broken items auto-selected.")
+        $issueRun.Foreground = 'Yellow'
+        $paragraph.Inlines.Add($issueRun)
+    }
+    else {
+        $okRun = New-Object System.Windows.Documents.Run("All components appear healthy.")
+        $okRun.Foreground = 'Lime'
+        $paragraph.Inlines.Add($okRun)
+    }
+
+    $paragraph.Margin = [System.Windows.Thickness]::new(0, 2, 0, 2)
+    $txtStatus.Document.Blocks.Add($paragraph)
 })
 
 # Show window
