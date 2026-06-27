@@ -2,6 +2,8 @@
 *.log
 *.tmp
 .vs/
+dist/
+Logs/
 CLAUDE.md
 
 # Markdown files local-only (except README)

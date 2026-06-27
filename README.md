@@ -1,203 +1,128 @@
-<p align="center"><img src="icon.svg" width="128" height="128" alt="DefenderShield"></p>
-
 # DefenderShield
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Platform-Windows%2010%2F11-blue?style=for-the-badge&logo=windows" alt="Platform">
-  <img src="https://img.shields.io/badge/Language-PowerShell-5391FE?style=for-the-badge&logo=powershell" alt="PowerShell">
-  <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License">
-</p>
+![Version](https://img.shields.io/badge/version-3.1.0-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4)
+![PowerShell](https://img.shields.io/badge/PowerShell-5.1-5391FE)
 
-<p align="center">
-  <b>Windows Defender & Firewall Repair Tool</b><br>
-  <i>Restore Windows security components after privacy tools have disabled them</i>
-</p>
+Windows Defender and Firewall repair tool for reversing privacy-tool and debloater breakage.
 
----
-
-
-![Screenshot](screenshot.png)
-
-## Overview
-
-**DefenderShield** is a comprehensive repair tool designed to restore Windows Defender and Windows Firewall after they've been disabled by privacy tools like [privacy.sexy](https://privacy.sexy), O&O ShutUp10, Windows debloaters, or manual registry modifications.
-
-Many users run privacy scripts to reduce telemetry but accidentally disable critical security components. DefenderShield reverses these changes with a simple GUI interface, letting you choose exactly which components to restore.
+![DefenderShield screenshot](screenshot.png)
 
 ## Features
 
-### 🔥 Windows Firewall Repair
-- Restores firewall service registry configurations
-- Removes Group Policy blocks
-- Enables all firewall profiles (Domain, Private, Public)
-- Resets firewall to default settings
-- Starts dependent services in correct order (BFE → mpssvc → IKEEXT → PolicyAgent)
-
-### 🛡️ Windows Defender Repair
-- Restores all Defender service registry keys
-- Removes 20+ known disabling registry values from Policy and direct paths
-- Repairs Defender driver configurations (WdFilter, WdBoot, WdNisDrv)
-- Re-enables disabled scheduled tasks
-- Detects and removes malicious scheduled tasks that re-disable Defender
-- Checks for and removes WMI event subscriptions targeting Defender
-- Resets local Group Policy blocking Defender
-- Re-registers Windows Security UWP app
-- Enables all protection features via Set-MpPreference
-- Triggers signature update
-
-### 🎯 Additional Features
-- **Selective Repair**: Choose to repair Firewall only, Defender only, or both
-- **System Restore Point**: Optionally creates a restore point before making changes
-- **Comprehensive Logging**: Detailed log saved to Desktop
-- **Registry Backup**: Backs up registry keys before modification
-- **Error Resilient**: Continues execution even if individual operations fail
-- **Auto-Elevation**: Automatically requests administrator privileges
-
-## Screenshots
-
-<p align="center">
-  <i>Main Interface</i><br>
-  <img src="screenshots/main.png" alt="DefenderShield Main Interface" width="600">
-</p>
+- Dark WPF GUI with health dashboard tiles for Defender, Firewall, Tamper Protection, signature age, and third-party AV.
+- Async GUI repair worker with streaming log, progress indicator, and generated HTML repair report.
+- CLI mode for PDQ, Intune, SCCM, local repair, status snapshots, snapshot diffing, watchdog tasks, and WinRM fleet repair.
+- Dry-run mode that records every planned action without writing system changes.
+- Undo manifest for registry, service, task, WMI, Appx, AppLocker, firewall, and Defender preference changes.
+- Firewall rule preservation before reset, with custom rules exported and re-imported.
+- Policy audit for registry, service, WMI, scheduled task, Group Policy, AppLocker, SRP, MDE, and Windows Update blockers.
+- DefenderControl undo artifact replay when local `.reg` restore artifacts are found.
+- Repairs Defender services, drivers, scheduled tasks, WMI subscriptions, Group Policy, Windows Security app registration, SmartScreen, MDE Sense, and Defender signature dependencies.
+- Repairs Windows Firewall services, policies, profiles, and dependency startup order.
+- Offline third-party AV uninstall guidance when another AV is registered as the active provider.
+- Portable mode that writes logs, reports, and backups under `.\Logs\`.
 
 ## Requirements
 
-- **OS**: Windows 10 / Windows 11
-- **Privileges**: Administrator
-- **PowerShell**: 5.1 or later (included with Windows)
+- Windows 10 or Windows 11
+- Windows PowerShell 5.1 or later
+- Administrator rights for repair, watchdog install/remove, and system changes
+- WinRM enabled for fleet mode
 
-## Installation
+## Run
 
-1. Download `DefenderShield.ps1` from the [Releases](../../releases) page
-2. Save to a convenient location (e.g., Desktop)
+GUI:
 
-## Usage
-
-### Method 1: Right-Click Run
-1. Right-click `DefenderShield.ps1`
-2. Select **Run with PowerShell**
-3. If prompted by UAC, click **Yes**
-
-### Method 2: PowerShell Direct
 ```powershell
 Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
 .\DefenderShield.ps1
 ```
 
-### Using the Interface
-1. **Select components** to repair using the checkboxes:
-   - ✅ Windows Firewall
-   - ✅ Windows Defender Antivirus
-   - ✅ Create System Restore Point (recommended)
+Status:
 
-2. Click **Start Repair**
-
-3. Watch the status output for progress
-
-4. When complete, click **Restart PC** (recommended)
-
-## Important Notes
-
-### Tamper Protection
-If Windows Defender won't start after repair, you may need to:
-
-1. Open **Windows Security**
-2. Go to **Virus & threat protection** → **Manage settings**
-3. Turn **OFF** Tamper Protection
-4. Run DefenderShield again
-5. Turn Tamper Protection back **ON**
-
-Tamper Protection is a security feature that prevents programs from modifying Defender settings. While it protects against malware, it also blocks legitimate repair tools.
-
-### What Gets Repaired
-
-| Component | Registry Keys | Services | Policies | Tasks |
-|-----------|--------------|----------|----------|-------|
-| Firewall | ✅ | ✅ | ✅ | — |
-| Defender | ✅ | ✅ | ✅ | ✅ |
-
-### Registry Values Removed
-
-The tool removes/resets these common blocking values:
-
-**Policy Keys** (`HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\...`)
-- `DisableAntiSpyware`
-- `DisableAntiVirus`
-- `DisableRealtimeMonitoring`
-- `DisableBehaviorMonitoring`
-- `DisableOnAccessProtection`
-- `DisableIOAVProtection`
-- `DisableScanOnRealtimeEnable`
-- And more...
-
-**Direct Keys** (`HKLM:\SOFTWARE\Microsoft\Windows Defender\...`)
-- Same values as above in the non-policy locations
-
-## Troubleshooting
-
-### "Script won't run" / Execution Policy Error
 ```powershell
-Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+.\DefenderShield.ps1 -Mode Status
+.\DefenderShield.ps1 -Mode Status -Json
+.\DefenderShield.ps1 -Mode Status -SnapshotPath .\status-before.json
+.\DefenderShield.ps1 -Mode Status -CompareSnapshot .\status-before.json
 ```
 
-### "Services won't start"
-- Restart your computer after running DefenderShield
-- Check if Tamper Protection needs to be temporarily disabled
-- Some deep modifications require Safe Mode to fully reverse
+Repair:
 
-### "Defender still shows as disabled"
-1. Ensure Tamper Protection is OFF
-2. Run DefenderShield again
-3. Restart computer
-4. Check Windows Security app
+```powershell
+.\DefenderShield.ps1 -Mode Both
+.\DefenderShield.ps1 -Mode Both -DryRun
+.\DefenderShield.ps1 -Mode Defender -Only Services,Registry,Tasks
+.\DefenderShield.ps1 -Mode Both -Skip SmartScreen
+.\DefenderShield.ps1 -Mode Both -Portable
+```
 
-### "Firewall won't enable"
-- Ensure no third-party firewall is installed (they often disable Windows Firewall)
-- Check if antivirus software is managing the firewall
+Automation:
+
+```powershell
+.\DefenderShield.ps1 -InstallWatchdog
+.\DefenderShield.ps1 -RemoveWatchdog
+.\DefenderShield.ps1 -Mode Both -ComputerName PC-01,PC-02
+```
+
+## Module Package
+
+Build a local module package:
+
+```powershell
+.\build-module.ps1
+```
+
+Install from the built package folder:
+
+```powershell
+$modulePath = "$HOME\Documents\WindowsPowerShell\Modules\DefenderShield\3.1.0"
+New-Item -Path $modulePath -ItemType Directory -Force | Out-Null
+Copy-Item -Path .\dist\DefenderShield\3.1.0\* -Destination $modulePath -Recurse -Force
+Import-Module DefenderShield
+Invoke-DefenderShield -Mode Status
+```
+
+The manifest is ready for `Publish-Module` once a PSGallery API key is available.
 
 ## Files Created
 
-| File | Location | Purpose |
-|------|----------|---------|
-| `DefenderShield_[timestamp].log` | Desktop | Detailed operation log |
-| `DefenderShield_Backup_[timestamp]/` | Desktop | Registry backups |
+| File | Default location | Purpose |
+| --- | --- | --- |
+| `DefenderShield_[timestamp].log` | Desktop or `.\Logs\` | Streaming operation log |
+| `DefenderShield_Backup_[timestamp]\` | Desktop or `.\Logs\` | Registry exports, WMI reports, firewall policy backups, undo manifest |
+| `DefenderShield_Report_[timestamp].html` | Desktop or `.\Logs\` | Color-coded repair report |
+| `undo-manifest.json` | Backup folder | Structured rollback data for every captured change |
+| `custom-firewall-rules.json` | Backup folder | Export of custom firewall rules preserved across reset |
+| `wmi-subscription-report.json` | Backup folder | WMI subscriptions found and removed |
 
-## Privacy & Safety
+## Exit Codes
 
-- ✅ **No data collection** - Everything runs locally
-- ✅ **No network requests** - Except Windows Update signature downloads
-- ✅ **Open source** - Full source code available for review
-- ✅ **Creates backups** - Registry exported before changes
-- ✅ **Restore point** - Optional system restore point creation
+| Code | Meaning |
+| --- | --- |
+| `0` | Success or healthy status |
+| `1` | Partial repair or issues detected in status mode |
+| `2` | Failed repair or command error |
+| `3` | Repair blocked by active third-party AV |
 
-## Contributing
+## Tamper Protection
 
-Contributions are welcome! If you find a privacy tool that breaks Defender/Firewall in a way DefenderShield doesn't fix:
+If Defender still will not start after repair:
 
-1. Note the exact tool and settings used
-2. Check which registry keys were modified
-3. Open an issue with the details
+1. Open Windows Security.
+2. Go to Virus and threat protection, then Manage settings.
+3. Turn Tamper Protection off.
+4. Run DefenderShield again.
+5. Turn Tamper Protection back on.
+
+## Safety
+
+DefenderShield runs locally. It does not collect data or make network calls except Microsoft Defender signature updates initiated through Windows.
+
+Backups and an undo manifest are written before destructive repair steps when possible. Some repairs still require a reboot before Windows reports healthy state.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Disclaimer
-
-This tool modifies Windows system settings and registry values. While it creates backups and is designed to be safe:
-
-- **Use at your own risk**
-- **Always have backups** of important data
-- **Test in a VM first** if unsure
-- The author is not responsible for any issues arising from use of this tool
-
-## Acknowledgments
-
-- Inspired by the need to help users who went too aggressive with privacy tools
-- Thanks to the privacy.sexy project for documenting what registry keys control Windows security features
-
----
-
-<p align="center">
-  Made with ☕ by Matt
-</p>
+MIT. See [LICENSE](LICENSE).

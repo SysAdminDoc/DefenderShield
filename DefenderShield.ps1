@@ -15,6 +15,10 @@
       .\DefenderShield.ps1 -Mode Both -DryRun
       .\DefenderShield.ps1 -Mode Defender -Silent
       .\DefenderShield.ps1 -Mode Both -Json
+      .\DefenderShield.ps1 -Mode Status -SnapshotPath .\status.json
+      .\DefenderShield.ps1 -Mode Status -CompareSnapshot .\status.json
+      .\DefenderShield.ps1 -InstallWatchdog
+      .\DefenderShield.ps1 -Mode Both -ComputerName PC-01,PC-02
 .PARAMETER Mode
     CLI operation mode: Defender, Firewall, Both, or Status. Omit for GUI.
 .PARAMETER DryRun
@@ -27,10 +31,24 @@
     Run only specific phases: Services, Registry, Tasks, WMI, GroupPolicy, Features, SmartScreen
 .PARAMETER Skip
     Skip specific phases (same values as -Only).
+.PARAMETER SnapshotPath
+    Save a Status mode snapshot to a JSON file.
+.PARAMETER CompareSnapshot
+    Compare current Status mode results against a saved snapshot JSON file.
+.PARAMETER InstallWatchdog
+    Install an opt-in scheduled task that repairs if Defender or Firewall drift off.
+.PARAMETER RemoveWatchdog
+    Remove the DefenderShield watchdog scheduled task.
+.PARAMETER WatchdogCheck
+    Internal watchdog entry point: repair only when status indicates drift.
+.PARAMETER ComputerName
+    Run the selected CLI mode against one or more WinRM targets.
+.PARAMETER Portable
+    Write logs, reports, and backups under .\Logs\ instead of Desktop.
 .NOTES
     Author: Matt
     Requires: Administrator privileges
-    Version: 3.0.0
+    Version: 3.1.0
 #>
 param(
     [ValidateSet('Defender', 'Firewall', 'Both', 'Status')]
@@ -42,29 +60,53 @@ param(
 
     [switch]$Json,
 
-    [ValidateSet('Services', 'Registry', 'Tasks', 'WMI', 'GroupPolicy', 'Features', 'SmartScreen')]
+    [ValidateSet('Services', 'Registry', 'Tasks', 'WMI', 'GroupPolicy', 'Features', 'SmartScreen', 'AppLocker', 'MDE', 'WindowsUpdate')]
     [string[]]$Only,
 
-    [ValidateSet('Services', 'Registry', 'Tasks', 'WMI', 'GroupPolicy', 'Features', 'SmartScreen')]
-    [string[]]$Skip
+    [ValidateSet('Services', 'Registry', 'Tasks', 'WMI', 'GroupPolicy', 'Features', 'SmartScreen', 'AppLocker', 'MDE', 'WindowsUpdate')]
+    [string[]]$Skip,
+
+    [switch]$Worker,
+
+    [string]$WorkerLogPath,
+
+    [string]$WorkerBackupPath,
+
+    [string]$WorkerReportPath,
+
+    [string]$SnapshotPath,
+
+    [string]$CompareSnapshot,
+
+    [switch]$InstallWatchdog,
+
+    [switch]$RemoveWatchdog,
+
+    [switch]$WatchdogCheck,
+
+    [string[]]$ComputerName,
+
+    [switch]$Portable
 )
 
 # ============================================================================
 # CONSTANTS & MODE DETECTION
 # ============================================================================
 
-$Script:Version = '3.0.0'
-$Script:CliMode = [bool]$Mode
+$Script:Version = '3.1.0'
+$Script:CliMode = [bool]($Mode -or $InstallWatchdog -or $RemoveWatchdog -or $WatchdogCheck -or ($ComputerName -and $ComputerName.Count -gt 0))
 $Script:IsDryRun = [bool]$DryRun
 $Script:IsSilent = [bool]$Silent
 $Script:IsJson = [bool]$Json
+$Script:IsWorker = [bool]$Worker
+$Script:IsPortable = [bool]$Portable
 $Script:ExitCode = 0  # 0=success, 1=partial, 2=failed, 3=blocked
 
 # Phase filtering
 $Script:ActivePhases = if ($Only -and $Only.Count -gt 0) {
     $Only
 } else {
-    @('Services', 'Registry', 'Tasks', 'WMI', 'GroupPolicy', 'Features', 'SmartScreen')
+    @('Services', 'Registry', 'Tasks', 'WMI', 'GroupPolicy', 'Features', 'SmartScreen', 'AppLocker', 'MDE', 'WindowsUpdate')
 }
 if ($Skip -and $Skip.Count -gt 0) {
     $Script:ActivePhases = $Script:ActivePhases | Where-Object { $_ -notin $Skip }
@@ -84,6 +126,8 @@ $Script:JsonOutput = @{
     preScan   = $null
     postScan  = $null
     actions   = [System.Collections.ArrayList]::new()
+    reports   = @{}
+    undo      = $null
     exitCode  = 0
 }
 
@@ -95,8 +139,11 @@ $Script:DryRunActions = [System.Collections.ArrayList]::new()
 # ============================================================================
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$hasFleetTargets = ($ComputerName -and $ComputerName.Count -gt 0)
+$localRepairMode = ($Mode -in @('Defender', 'Firewall', 'Both')) -and -not $hasFleetTargets
+$requiresAdmin = (-not $Script:IsWorker) -and ((-not $Script:CliMode) -or $localRepairMode -or $InstallWatchdog -or $RemoveWatchdog -or $WatchdogCheck)
 
-if (-not $isAdmin) {
+if (-not $isAdmin -and $requiresAdmin) {
     if ($Script:CliMode) {
         if (-not $Script:IsSilent) {
             Write-Host 'ERROR: DefenderShield requires Administrator privileges.' -ForegroundColor Red
@@ -112,6 +159,13 @@ if (-not $isAdmin) {
         if ($Json)    { $argList += ' -Json' }
         if ($Only)    { $argList += " -Only $($Only -join ',')" }
         if ($Skip)    { $argList += " -Skip $($Skip -join ',')" }
+        if ($Portable) { $argList += ' -Portable' }
+        if ($SnapshotPath) { $argList += " -SnapshotPath `"$SnapshotPath`"" }
+        if ($CompareSnapshot) { $argList += " -CompareSnapshot `"$CompareSnapshot`"" }
+        if ($InstallWatchdog) { $argList += ' -InstallWatchdog' }
+        if ($RemoveWatchdog) { $argList += ' -RemoveWatchdog' }
+        if ($WatchdogCheck) { $argList += ' -WatchdogCheck' }
+        if ($ComputerName) { $argList += " -ComputerName $($ComputerName -join ',')" }
         Start-Process powershell.exe -ArgumentList $argList -Verb RunAs -ErrorAction Stop
         exit
     }
@@ -137,7 +191,19 @@ if (-not $Script:CliMode) {
 $Script:Config = @{
     LogPath    = "$env:USERPROFILE\Desktop\DefenderShield_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
     BackupPath = "$env:USERPROFILE\Desktop\DefenderShield_Backup_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    ReportPath = "$env:USERPROFILE\Desktop\DefenderShield_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
 }
+
+if ($Script:IsPortable) {
+    $portableRoot = Join-Path $PSScriptRoot 'Logs'
+    $Script:Config.LogPath = Join-Path $portableRoot "DefenderShield_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+    $Script:Config.BackupPath = Join-Path $portableRoot "DefenderShield_Backup_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+    $Script:Config.ReportPath = Join-Path $portableRoot "DefenderShield_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+}
+
+if ($WorkerLogPath) { $Script:Config.LogPath = $WorkerLogPath }
+if ($WorkerBackupPath) { $Script:Config.BackupPath = $WorkerBackupPath }
+if ($WorkerReportPath) { $Script:Config.ReportPath = $WorkerReportPath }
 
 $Script:DefenderServices = @(
     @{ Name = 'WinDefend'; DisplayName = 'Microsoft Defender Antivirus Service'; StartType = 'Automatic' },
@@ -156,8 +222,36 @@ $Script:FirewallServices = @(
     @{ Name = 'PolicyAgent'; DisplayName = 'IPsec Policy Agent'; StartType = 'Manual' }
 )
 
+$Script:WindowsUpdateServices = @(
+    @{ Name = 'wuauserv'; DisplayName = 'Windows Update'; StartType = 'Manual'; StartValue = 3 },
+    @{ Name = 'UsoSvc'; DisplayName = 'Update Orchestrator Service'; StartType = 'Automatic'; StartValue = 2 },
+    @{ Name = 'DoSvc'; DisplayName = 'Delivery Optimization'; StartType = 'AutomaticDelayed'; StartValue = 2 },
+    @{ Name = 'BITS'; DisplayName = 'Background Intelligent Transfer Service'; StartType = 'Manual'; StartValue = 3 }
+)
+
+$Script:MdeServices = @(
+    @{ Name = 'Sense'; DisplayName = 'Microsoft Defender for Endpoint Sensor'; StartType = 'Manual'; StartValue = 3 }
+)
+
+$Script:ThirdPartyAVGuidance = @(
+    @{ Pattern = 'Norton|Symantec'; Name = 'Norton/Symantec'; Guidance = 'Use Norton Remove and Reinstall Tool, then reboot before repairing Defender.' },
+    @{ Pattern = 'McAfee'; Name = 'McAfee'; Guidance = 'Use McAfee Consumer Product Removal (MCPR), then reboot before repairing Defender.' },
+    @{ Pattern = 'Avast'; Name = 'Avast'; Guidance = 'Use Avast Uninstall Utility in Safe Mode when normal uninstall leaves providers registered.' },
+    @{ Pattern = 'AVG'; Name = 'AVG'; Guidance = 'Use AVG Clear in Safe Mode when normal uninstall leaves providers registered.' },
+    @{ Pattern = 'Bitdefender'; Name = 'Bitdefender'; Guidance = 'Use Bitdefender Uninstall Tool for the installed product family, then reboot.' },
+    @{ Pattern = 'Kaspersky'; Name = 'Kaspersky'; Guidance = 'Use kavremover if normal uninstall does not remove the Security Center provider.' },
+    @{ Pattern = 'ESET'; Name = 'ESET'; Guidance = 'Use ESET Uninstaller from Safe Mode if standard removal leaves services registered.' },
+    @{ Pattern = 'Sophos'; Name = 'Sophos'; Guidance = 'Use SophosZap only after normal uninstall fails, then reboot.' },
+    @{ Pattern = 'Trend Micro'; Name = 'Trend Micro'; Guidance = 'Use Trend Micro Diagnostic Toolkit uninstall cleanup, then reboot.' },
+    @{ Pattern = 'Malwarebytes'; Name = 'Malwarebytes'; Guidance = 'Disable registered antivirus mode or uninstall with Malwarebytes Support Tool before repairing Defender.' }
+)
+
 # Stores pre-repair scan results for before/after comparison
 $Script:PreRepairScan = $null
+$Script:UndoManifest = $null
+$Script:WmiRemovalReport = [System.Collections.ArrayList]::new()
+$Script:ReportEntries = [System.Collections.ArrayList]::new()
+$Script:LastReportPath = $null
 
 # ============================================================================
 # LOGGING
@@ -178,12 +272,173 @@ function Write-Log {
         [void]$Script:JsonOutput.actions.Add(@{ level = $Level; message = $Message; timestamp = $timestamp })
     }
 
+    if ($Script:ReportEntries) {
+        [void]$Script:ReportEntries.Add([ordered]@{
+            timestamp = $timestamp
+            level     = $Level
+            message   = $Message
+        })
+    }
+
     try {
+        $logDir = Split-Path -Parent $Script:Config.LogPath
+        if ($logDir -and -not (Test-Path -LiteralPath $logDir)) {
+            New-Item -Path $logDir -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+        }
         Add-Content -Path $Script:Config.LogPath -Value $logMessage -ErrorAction SilentlyContinue
     }
     catch { }
 
     return $logMessage
+}
+
+function Ensure-BackupDirectory {
+    try {
+        if (-not (Test-Path -LiteralPath $Script:Config.BackupPath)) {
+            New-Item -Path $Script:Config.BackupPath -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Initialize-UndoManifest {
+    if ($Script:UndoManifest) { return }
+
+    Ensure-BackupDirectory | Out-Null
+    $Script:UndoManifest = [ordered]@{
+        tool          = 'DefenderShield'
+        version       = $Script:Version
+        created       = (Get-Date -Format 'o')
+        computerName  = $env:COMPUTERNAME
+        logPath       = $Script:Config.LogPath
+        backupPath    = $Script:Config.BackupPath
+        dryRun        = $Script:IsDryRun
+        changes       = [System.Collections.ArrayList]::new()
+    }
+}
+
+function Add-UndoEntry {
+    param(
+        [string]$Type,
+        [string]$Action,
+        [string]$Target,
+        [object]$Before,
+        [object]$After,
+        [object]$Rollback,
+        [string]$Status = 'Planned'
+    )
+
+    Initialize-UndoManifest
+    $entry = [ordered]@{
+        id        = $Script:UndoManifest.changes.Count + 1
+        timestamp = (Get-Date -Format 'o')
+        type      = $Type
+        action    = $Action
+        target    = $Target
+        before    = $Before
+        after     = $After
+        rollback  = $Rollback
+        status    = $Status
+    }
+    [void]$Script:UndoManifest.changes.Add($entry)
+    return $entry
+}
+
+function Save-UndoManifest {
+    Initialize-UndoManifest
+    try {
+        Ensure-BackupDirectory | Out-Null
+        $manifestPath = Join-Path $Script:Config.BackupPath 'undo-manifest.json'
+        $Script:UndoManifest.completed = (Get-Date -Format 'o')
+        $Script:UndoManifest.logPath = $Script:Config.LogPath
+        $Script:UndoManifest.reportPath = $Script:Config.ReportPath
+        $Script:UndoManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+        $Script:JsonOutput.undo = $manifestPath
+        Update-Status "Undo manifest: $manifestPath" -Level SUCCESS
+        return $manifestPath
+    }
+    catch {
+        Update-Status "Could not write undo manifest: $($_.Exception.Message)" -Level WARNING
+        return $null
+    }
+}
+
+function ConvertTo-HtmlSafe {
+    param([object]$Value)
+    if ($null -eq $Value) { return '' }
+    return [System.Net.WebUtility]::HtmlEncode([string]$Value)
+}
+
+function Export-RepairReport {
+    try {
+        Ensure-BackupDirectory | Out-Null
+        $rows = New-Object System.Text.StringBuilder
+        foreach ($entry in $Script:ReportEntries) {
+            $class = $entry.level.ToLowerInvariant()
+            [void]$rows.AppendLine("<tr class='$class'><td>$(ConvertTo-HtmlSafe $entry.timestamp)</td><td>$(ConvertTo-HtmlSafe $entry.level)</td><td>$(ConvertTo-HtmlSafe $entry.message)</td></tr>")
+        }
+
+        $changeRows = New-Object System.Text.StringBuilder
+        if ($Script:UndoManifest -and $Script:UndoManifest.changes) {
+            foreach ($change in $Script:UndoManifest.changes) {
+                [void]$changeRows.AppendLine("<tr><td>$(ConvertTo-HtmlSafe $change.id)</td><td>$(ConvertTo-HtmlSafe $change.type)</td><td>$(ConvertTo-HtmlSafe $change.action)</td><td>$(ConvertTo-HtmlSafe $change.target)</td><td>$(ConvertTo-HtmlSafe $change.status)</td></tr>")
+            }
+        }
+
+        $html = @"
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DefenderShield Repair Report</title>
+<style>
+body { background:#1e1e2e; color:#cdd6f4; font-family:Segoe UI,Arial,sans-serif; margin:24px; }
+h1,h2 { color:#89b4fa; }
+table { border-collapse:collapse; width:100%; margin:16px 0 28px; }
+th,td { border:1px solid #45475a; padding:8px 10px; text-align:left; vertical-align:top; }
+th { background:#181825; color:#bac2de; }
+.success td { color:#a6e3a1; }
+.warning td { color:#f9e2af; }
+.error td { color:#f38ba8; }
+.section td { color:#89b4fa; font-weight:600; }
+.meta { color:#a6adc8; }
+</style>
+</head>
+<body>
+<h1>DefenderShield v$($Script:Version) Repair Report</h1>
+<p class="meta">Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') on $(ConvertTo-HtmlSafe $env:COMPUTERNAME)</p>
+<p class="meta">Log: $(ConvertTo-HtmlSafe $Script:Config.LogPath)</p>
+<p class="meta">Backups: $(ConvertTo-HtmlSafe $Script:Config.BackupPath)</p>
+<h2>Changes</h2>
+<table>
+<thead><tr><th>ID</th><th>Type</th><th>Action</th><th>Target</th><th>Status</th></tr></thead>
+<tbody>
+$changeRows
+</tbody>
+</table>
+<h2>Run Log</h2>
+<table>
+<thead><tr><th>Time</th><th>Level</th><th>Message</th></tr></thead>
+<tbody>
+$rows
+</tbody>
+</table>
+</body>
+</html>
+"@
+        $html | Set-Content -LiteralPath $Script:Config.ReportPath -Encoding UTF8
+        $Script:LastReportPath = $Script:Config.ReportPath
+        $Script:JsonOutput.reports['html'] = $Script:Config.ReportPath
+        Update-Status "HTML report: $($Script:Config.ReportPath)" -Level SUCCESS
+        return $Script:Config.ReportPath
+    }
+    catch {
+        Update-Status "Could not export HTML report: $($_.Exception.Message)" -Level WARNING
+        return $null
+    }
 }
 
 function Update-Status {
@@ -214,28 +469,38 @@ function Update-Status {
 
     # GUI mode: write to RichTextBox
     if ($Script:StatusTextBox) {
-        try {
-            $Script:StatusTextBox.Dispatcher.Invoke([action]{
-                # Catppuccin Mocha colors
-                $color = switch ($Level) {
-                    'SUCCESS' { '#a6e3a1' }   # Green
-                    'WARNING' { '#f9e2af' }   # Yellow
-                    'ERROR'   { '#f38ba8' }   # Red
-                    'SECTION' { '#89b4fa' }   # Blue
-                    default   { '#cdd6f4' }   # Text
-                }
-
-                $paragraph = New-Object System.Windows.Documents.Paragraph
-                $run = New-Object System.Windows.Documents.Run($Message)
-                $run.Foreground = $color
-                $paragraph.Inlines.Add($run)
-                $paragraph.Margin = [System.Windows.Thickness]::new(0, 2, 0, 2)
-                $Script:StatusTextBox.Document.Blocks.Add($paragraph)
-                $Script:StatusTextBox.ScrollToEnd()
-            }, [System.Windows.Threading.DispatcherPriority]::Background)
-        }
-        catch { }
+        Add-GuiStatusLine -Message $Message -Level $Level
     }
+}
+
+function Add-GuiStatusLine {
+    param(
+        [string]$Message,
+        [string]$Level = 'INFO'
+    )
+
+    if (-not $Script:StatusTextBox) { return }
+
+    try {
+        $Script:StatusTextBox.Dispatcher.Invoke([action]{
+            $color = switch ($Level) {
+                'SUCCESS' { '#a6e3a1' }
+                'WARNING' { '#f9e2af' }
+                'ERROR'   { '#f38ba8' }
+                'SECTION' { '#89b4fa' }
+                default   { '#cdd6f4' }
+            }
+
+            $paragraph = New-Object System.Windows.Documents.Paragraph
+            $run = New-Object System.Windows.Documents.Run($Message)
+            $run.Foreground = $color
+            $paragraph.Inlines.Add($run)
+            $paragraph.Margin = [System.Windows.Thickness]::new(0, 2, 0, 2)
+            $Script:StatusTextBox.Document.Blocks.Add($paragraph)
+            $Script:StatusTextBox.ScrollToEnd()
+        }, [System.Windows.Threading.DispatcherPriority]::Background)
+    }
+    catch { }
 }
 
 # ============================================================================
@@ -350,6 +615,22 @@ function Get-HealthScan {
         $scan['SmartScreen'] = 'Unknown'
     }
 
+    try {
+        $avList = Get-ThirdPartyAV
+        $scan['ThirdPartyAV'] = if ($avList) { ($avList | ForEach-Object { $_.Name }) -join ', ' } else { 'None' }
+    }
+    catch {
+        $scan['ThirdPartyAV'] = 'Unknown'
+    }
+
+    try {
+        $sense = Get-ServiceHealthStatus 'Sense'
+        $scan['MDE'] = $sense
+    }
+    catch {
+        $scan['MDE'] = 'Unknown'
+    }
+
     return $scan
 }
 
@@ -365,6 +646,8 @@ function Get-HealthColor {
         'RealTimeProtection'   { if ($Value -eq 'ON') { '#a6e3a1' } else { '#f38ba8' } }
         'TamperProtection'     { if ($Value -eq 'ON') { '#a6e3a1' } else { '#f9e2af' } }
         'SmartScreen'          { if ($Value -eq 'ON') { '#a6e3a1' } elseif ($Value -eq 'OFF') { '#f38ba8' } else { '#f9e2af' } }
+        'ThirdPartyAV'         { if ($Value -eq 'None') { '#a6e3a1' } elseif ($Value -eq 'Unknown') { '#f9e2af' } else { '#f38ba8' } }
+        'MDE'                  { if ($Value -eq 'Running') { '#a6e3a1' } elseif ($Value -in @('Stopped', 'Missing')) { '#f9e2af' } else { '#f38ba8' } }
         'DefinitionAge'        {
             $days = [int]$Value
             if ($days -lt 0) { '#f38ba8' } elseif ($days -le 3) { '#a6e3a1' } elseif ($days -le 7) { '#f9e2af' } else { '#f38ba8' }
@@ -379,6 +662,26 @@ function Update-HealthDashboard {
     param([hashtable]$Scan)
 
     if (-not $Script:DashboardLabels) { return }
+
+    if ($Script:DashboardLabels['lblTileDefenderStatus']) {
+        $defenderBroken = Test-DefenderBroken -Scan $Scan
+        $firewallBroken = Test-FirewallBroken -Scan $Scan
+        $tileData = @(
+            @{ Name = 'lblTileDefenderStatus'; Value = if ($defenderBroken) { 'Repair needed' } else { 'Healthy' }; Component = 'RealTimeProtection'; ColorValue = if ($defenderBroken) { 'OFF' } else { 'ON' } },
+            @{ Name = 'lblTileFirewallStatus'; Value = if ($firewallBroken) { 'Repair needed' } else { 'Healthy' }; Component = 'MpsSvc'; ColorValue = $Scan['MpsSvc'] },
+            @{ Name = 'lblTileTamperStatus'; Value = $Scan['TamperProtection']; Component = 'TamperProtection'; ColorValue = $Scan['TamperProtection'] },
+            @{ Name = 'lblTileSignatureStatus'; Value = if ($Scan['DefinitionAge'] -ge 0) { "$($Scan['DefinitionAge']) days" } else { 'Unknown' }; Component = 'DefinitionAge'; ColorValue = $Scan['DefinitionAge'] },
+            @{ Name = 'lblTileAvStatus'; Value = $Scan['ThirdPartyAV']; Component = 'ThirdPartyAV'; ColorValue = $Scan['ThirdPartyAV'] }
+        )
+
+        foreach ($tile in $tileData) {
+            $label = $Script:DashboardLabels[$tile.Name]
+            if ($label) {
+                $label.Text = $tile.Value
+                $label.Foreground = Get-HealthColor -Component $tile.Component -Value ([string]$tile.ColorValue)
+            }
+        }
+    }
 
     $labelMap = @{
         'WinDefend'            = @{ Label = 'lblWinDefend'; Value = $Scan['WinDefend'] }
@@ -504,6 +807,32 @@ function Get-ThirdPartyAV {
     return $null
 }
 
+function Get-ThirdPartyAVGuidance {
+    param([array]$AVList)
+
+    $guidance = @()
+    foreach ($av in @($AVList)) {
+        if (-not $av) { continue }
+        $match = $Script:ThirdPartyAVGuidance | Where-Object { $av.Name -match $_.Pattern } | Select-Object -First 1
+        if ($match) {
+            $guidance += [ordered]@{
+                product  = $av.Name
+                family   = $match.Name
+                guidance = $match.Guidance
+            }
+        }
+        else {
+            $guidance += [ordered]@{
+                product  = $av.Name
+                family   = 'Unknown'
+                guidance = 'Use the vendor cleanup tool or fully uninstall this antivirus, reboot, then repair Defender.'
+            }
+        }
+    }
+
+    return $guidance
+}
+
 function Test-ThirdPartyAVBlocking {
     <#
     .SYNOPSIS
@@ -517,6 +846,9 @@ function Test-ThirdPartyAVBlocking {
     Update-Status "BLOCKED: Third-party antivirus detected: $avNames" -Level ERROR
     Update-Status "A third-party AV is registered as the active security provider." -Level WARNING
     Update-Status "Uninstall the third-party AV before running DefenderShield, or it will fight the repair." -Level WARNING
+    foreach ($hint in Get-ThirdPartyAVGuidance -AVList $avList) {
+        Update-Status "$($hint.product): $($hint.guidance)" -Level WARNING
+    }
 
     $Script:ExitCode = 3
     return $true
@@ -698,6 +1030,32 @@ function Get-PolicySourceAudit {
         catch { }
     }
 
+    foreach ($svc in @($Script:WindowsUpdateServices + $Script:MdeServices)) {
+        try {
+            $startType = Get-ServiceStartValue -ServiceName $svc.Name
+            if ($startType -eq 4) {
+                $blockers += @{
+                    Source = 'Service'
+                    Label  = "$($svc.Name) disabled"
+                    Detail = "$($svc.DisplayName) Start type = 4 (Disabled)"
+                }
+            }
+        }
+        catch { }
+    }
+
+    try {
+        $appLockerBlockers = @(Get-AppLockerMsMpEngBlockers)
+        foreach ($blocker in $appLockerBlockers) {
+            $blockers += @{
+                Source = $blocker.Source
+                Label  = "$($blocker.Source) blocks Defender"
+                Detail = $blocker.Detail
+            }
+        }
+    }
+    catch { }
+
     # --- WMI subscription blockers ---
     try {
         $filters = Get-WmiObject -Query "SELECT * FROM __EventFilter WHERE Name LIKE '%Defender%' OR Name LIKE '%WinDefend%'" -Namespace 'root\subscription' -ErrorAction SilentlyContinue
@@ -779,6 +1137,193 @@ function Show-PolicySourceAudit {
     }
 }
 
+function New-StatusSnapshot {
+    $avList = Get-ThirdPartyAV
+    $thirdPartyAV = @()
+    $avGuidance = @()
+    if ($avList) {
+        $thirdPartyAV = @($avList)
+        $avGuidance = @(Get-ThirdPartyAVGuidance -AVList $avList)
+    }
+
+    return [ordered]@{
+        version       = $Script:Version
+        timestamp     = (Get-Date -Format 'o')
+        computerName  = $env:COMPUTERNAME
+        scan          = Get-HealthScan
+        privacyTools  = @(Get-DetectedPrivacyTools)
+        blockers      = @(Get-PolicySourceAudit)
+        thirdPartyAV  = $thirdPartyAV
+        avGuidance    = $avGuidance
+    }
+}
+
+function Save-StatusSnapshot {
+    param(
+        [object]$Snapshot,
+        [string]$Path
+    )
+
+    try {
+        $dir = Split-Path -Parent $Path
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -Path $dir -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+        $Snapshot | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding UTF8
+        return $true
+    }
+    catch {
+        Write-Warning "Could not write snapshot: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Compare-StatusSnapshot {
+    param(
+        [object]$Previous,
+        [object]$Current
+    )
+
+    $diff = [System.Collections.ArrayList]::new()
+    $previousScan = @{}
+    if ($Previous.scan) {
+        foreach ($prop in $Previous.scan.PSObject.Properties) {
+            $previousScan[$prop.Name] = $prop.Value
+        }
+    }
+
+    foreach ($prop in $Current.scan.GetEnumerator()) {
+        $old = if ($previousScan.ContainsKey($prop.Key)) { $previousScan[$prop.Key] } else { '<missing>' }
+        $new = $prop.Value
+        if ([string]$old -ne [string]$new) {
+            [void]$diff.Add([ordered]@{
+                component = $prop.Key
+                before    = $old
+                after     = $new
+            })
+        }
+    }
+
+    $oldBlockers = if ($Previous.blockers) { @($Previous.blockers).Count } else { 0 }
+    $newBlockers = if ($Current.blockers) { @($Current.blockers).Count } else { 0 }
+    if ($oldBlockers -ne $newBlockers) {
+        [void]$diff.Add([ordered]@{
+            component = 'ActiveBlockers'
+            before    = $oldBlockers
+            after     = $newBlockers
+        })
+    }
+
+    return @($diff)
+}
+
+function Show-StatusDiff {
+    param([array]$Diff)
+
+    if (-not $Diff -or $Diff.Count -eq 0) {
+        Write-Host 'No status drift detected.' -ForegroundColor Green
+        return
+    }
+
+    Write-Host 'Status drift detected:' -ForegroundColor Yellow
+    Write-Host ("{0,-24} {1,-24} {2}" -f 'COMPONENT', 'BEFORE', 'AFTER') -ForegroundColor Cyan
+    foreach ($item in $Diff) {
+        Write-Host ("{0,-24} {1,-24} {2}" -f $item.component, $item.before, $item.after) -ForegroundColor Yellow
+    }
+}
+
+function Install-WatchdogTask {
+    $taskName = 'DefenderShield Watchdog'
+    $scriptPath = $PSCommandPath
+    $argument = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -WatchdogCheck -Silent"
+    if ($Script:IsPortable) { $argument += ' -Portable' }
+
+    try {
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument
+        $triggers = @(
+            (New-ScheduledTaskTrigger -AtLogOn),
+            (New-ScheduledTaskTrigger -Daily -At 9am)
+        )
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 2)
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $triggers -Principal $principal -Settings $settings -Force | Out-Null
+        Write-Host "Installed scheduled task: $taskName" -ForegroundColor Green
+        exit 0
+    }
+    catch {
+        Write-Warning "Could not install watchdog: $($_.Exception.Message)"
+        exit 2
+    }
+}
+
+function Remove-WatchdogTask {
+    $taskName = 'DefenderShield Watchdog'
+    try {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
+        Write-Host "Removed scheduled task: $taskName" -ForegroundColor Green
+        exit 0
+    }
+    catch {
+        Write-Warning "Could not remove watchdog: $($_.Exception.Message)"
+        exit 2
+    }
+}
+
+function Invoke-WatchdogCheck {
+    $scan = Get-HealthScan
+    $defBroken = Test-DefenderBroken -Scan $scan
+    $fwBroken = Test-FirewallBroken -Scan $scan
+    if (-not $defBroken -and -not $fwBroken) {
+        if (-not $Script:IsSilent) { Write-Host 'DefenderShield watchdog: system healthy.' -ForegroundColor Green }
+        exit 0
+    }
+
+    if (-not $Script:IsSilent) { Write-Host 'DefenderShield watchdog: repair needed.' -ForegroundColor Yellow }
+    $Script:JsonOutput.preScan = $scan
+    Start-Repair -RepairFirewall $fwBroken -RepairDefender $defBroken -CreateRestorePoint $false | Out-Null
+    exit $Script:ExitCode
+}
+
+function Invoke-FleetRepair {
+    param([string[]]$Targets)
+
+    $scriptText = Get-Content -LiteralPath $PSCommandPath -Raw
+    $results = @()
+    foreach ($target in $Targets) {
+        try {
+            $remoteResult = Invoke-Command -ComputerName $target -ScriptBlock {
+                param($ScriptText, $ModeValue, $DryRunValue, $SilentValue, $JsonValue, $OnlyValue, $SkipValue)
+
+                $remotePath = Join-Path $env:TEMP 'DefenderShield-Remote.ps1'
+                Set-Content -LiteralPath $remotePath -Value $ScriptText -Encoding UTF8
+                $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $remotePath, '-Mode', $ModeValue)
+                if ($DryRunValue) { $args += '-DryRun' }
+                if ($SilentValue) { $args += '-Silent' }
+                if ($JsonValue) { $args += '-Json' }
+                if ($OnlyValue) { $args += @('-Only', ($OnlyValue -join ',')) }
+                if ($SkipValue) { $args += @('-Skip', ($SkipValue -join ',')) }
+                & powershell.exe @args
+                $LASTEXITCODE
+            } -ArgumentList $scriptText, $Mode, $Script:IsDryRun, $Script:IsSilent, $Script:IsJson, $Only, $Skip -ErrorAction Stop
+
+            $exitCode = @($remoteResult)[-1]
+            $results += [ordered]@{ computerName = $target; exitCode = $exitCode; status = 'Complete' }
+            if (-not $Script:IsSilent) { Write-Host "$target : exit $exitCode" -ForegroundColor Cyan }
+        }
+        catch {
+            $results += [ordered]@{ computerName = $target; exitCode = 2; status = $_.Exception.Message }
+            if (-not $Script:IsSilent) { Write-Warning "$target : $($_.Exception.Message)" }
+        }
+    }
+
+    if ($Script:IsJson) {
+        Write-Output (@{ version = $Script:Version; fleet = $results } | ConvertTo-Json -Depth 5)
+    }
+
+    if (($results | Where-Object { $_.exitCode -ne 0 }).Count -gt 0) { exit 1 }
+    exit 0
+}
+
 # ============================================================================
 # SMARTSCREEN REPAIR
 # ============================================================================
@@ -808,17 +1353,9 @@ function Repair-SmartScreen {
                 continue
             }
 
-            if (-not (Test-Path $item.Path)) {
-                New-Item -Path $item.Path -Force -ErrorAction SilentlyContinue | Out-Null
+            if (Set-RegistryValue -Path $item.Path -Name $item.Name -Value $item.Value -Type $item.Type) {
+                $repaired++
             }
-
-            if ($item.Name -eq '(Default)') {
-                Set-ItemProperty -Path $item.Path -Name '(Default)' -Value $item.Value -Force -ErrorAction SilentlyContinue
-            }
-            else {
-                Set-ItemProperty -Path $item.Path -Name $item.Name -Value $item.Value -Type $item.Type -Force -ErrorAction SilentlyContinue
-            }
-            $repaired++
         }
         catch { }
     }
@@ -839,7 +1376,7 @@ function Repair-SmartScreen {
                         Update-Status "[DRY-RUN] Would remove blocking policy $($pol.Path)\$($pol.Name)" -Level INFO
                     }
                     else {
-                        Remove-ItemProperty -Path $pol.Path -Name $pol.Name -Force -ErrorAction SilentlyContinue
+                        Remove-RegistryValue -Path $pol.Path -Name $pol.Name | Out-Null
                     }
                     $repaired++
                 }
@@ -1011,10 +1548,22 @@ function Set-RegistryValue {
     )
 
     try {
-        if (-not (Test-Path $Path)) {
+        $before = Get-RegistryValueState -Path $Path -Name $Name
+        Add-UndoEntry -Type 'Registry' -Action 'SetValue' -Target "$Path\$Name" -Before $before -After @{ exists = $true; value = $Value; type = $Type } -Rollback @{ action = if ($before.exists) { 'SetValue' } else { 'RemoveValue' }; value = $before.value; type = $before.type } -Status $(if ($Script:IsDryRun) { 'DryRun' } else { 'Applied' }) | Out-Null
+
+        if ($Script:IsDryRun) {
+            return $true
+        }
+
+        if (-not (Test-Path -LiteralPath $Path)) {
             New-Item -Path $Path -Force -ErrorAction SilentlyContinue | Out-Null
         }
-        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -Force -ErrorAction SilentlyContinue
+        if ($before.exists) {
+            Set-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -Force -ErrorAction SilentlyContinue
+        }
+        else {
+            New-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -PropertyType $Type -Force -ErrorAction SilentlyContinue | Out-Null
+        }
         return $true
     }
     catch {
@@ -1029,8 +1578,12 @@ function Remove-RegistryValue {
     )
 
     try {
-        if (Test-Path $Path) {
-            Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction SilentlyContinue
+        $before = Get-RegistryValueState -Path $Path -Name $Name
+        if ($before.exists) {
+            Add-UndoEntry -Type 'Registry' -Action 'RemoveValue' -Target "$Path\$Name" -Before $before -After @{ exists = $false } -Rollback @{ action = 'SetValue'; value = $before.value; type = $before.type } -Status $(if ($Script:IsDryRun) { 'DryRun' } else { 'Applied' }) | Out-Null
+            if (-not $Script:IsDryRun) {
+                Remove-ItemProperty -LiteralPath $Path -Name $Name -Force -ErrorAction SilentlyContinue
+            }
             return $true
         }
         return $false
@@ -1047,17 +1600,163 @@ function Backup-RegistryKey {
     )
 
     try {
-        if (-not (Test-Path $Script:Config.BackupPath)) {
-            New-Item -Path $Script:Config.BackupPath -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
-        }
+        Ensure-BackupDirectory | Out-Null
 
         $exportPath = Join-Path $Script:Config.BackupPath "$BackupName.reg"
         $regPath = $KeyPath -replace '^HKLM:\\', 'HKEY_LOCAL_MACHINE\' -replace '^HKCU:\\', 'HKEY_CURRENT_USER\'
 
         $null = reg export $regPath $exportPath /y 2>&1
+        return $exportPath
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-RegistryValueState {
+    param(
+        [string]$Path,
+        [string]$Name
+    )
+
+    $state = [ordered]@{
+        exists = $false
+        value  = $null
+        type   = $null
+    }
+
+    try {
+        if (Test-Path -LiteralPath $Path) {
+            $item = Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction SilentlyContinue
+            if ($null -ne $item -and $item.PSObject.Properties.Name -contains $Name) {
+                $state.exists = $true
+                $state.value = $item.$Name
+                if ($null -ne $state.value) {
+                    $state.type = $state.value.GetType().Name
+                }
+            }
+        }
+    }
+    catch { }
+
+    return $state
+}
+
+function Remove-RegistryKeyTree {
+    param(
+        [string]$Path,
+        [string]$BackupName,
+        [string]$Label = $Path
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return $false }
+        $backupPath = Backup-RegistryKey -KeyPath $Path -BackupName $BackupName
+        Add-UndoEntry -Type 'Registry' -Action 'RemoveKeyTree' -Target $Path -Before @{ exists = $true; backup = $backupPath } -After @{ exists = $false } -Rollback @{ action = 'reg import'; file = $backupPath } -Status $(if ($Script:IsDryRun) { 'DryRun' } else { 'Applied' }) | Out-Null
+        if ($Script:IsDryRun) { return $true }
+
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+        Update-Status "Removed: $Label" -Level SUCCESS
         return $true
     }
     catch {
+        Update-Status "Could not remove: $Label (continuing...)" -Level WARNING
+        return $false
+    }
+}
+
+function Get-ServiceStartValue {
+    param([string]$ServiceName)
+    try {
+        $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+        if (Test-Path -LiteralPath $regPath) {
+            return (Get-ItemProperty -LiteralPath $regPath -Name 'Start' -ErrorAction SilentlyContinue).Start
+        }
+    }
+    catch { }
+    return $null
+}
+
+function Set-ServiceStartValue {
+    param(
+        [string]$ServiceName,
+        [string]$DisplayName,
+        [int]$StartValue,
+        [string]$StartType
+    )
+
+    $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    $before = Get-ServiceStartValue -ServiceName $ServiceName
+    Add-UndoEntry -Type 'Service' -Action 'SetStartType' -Target $ServiceName -Before @{ start = $before } -After @{ start = $StartValue; startType = $StartType } -Rollback @{ action = 'SetStart'; value = $before } -Status $(if ($Script:IsDryRun) { 'DryRun' } else { 'Applied' }) | Out-Null
+
+    if ($Script:IsDryRun) {
+        Update-Status "[DRY-RUN] Would set $regPath\Start = $StartValue" -Level INFO
+        [void]$Script:DryRunActions.Add("Set $regPath\Start = $StartValue")
+        return $true
+    }
+
+    try {
+        if (Test-Path -LiteralPath $regPath) {
+            Set-ItemProperty -LiteralPath $regPath -Name 'Start' -Value $StartValue -Force -ErrorAction SilentlyContinue
+            Update-Status "${DisplayName}: Registry repaired" -Level SUCCESS
+        }
+
+        $scStart = switch ($StartType) {
+            'Automatic' { 'auto' }
+            'AutomaticDelayed' { 'delayed-auto' }
+            'Manual' { 'demand' }
+            'Disabled' { 'disabled' }
+            default { $null }
+        }
+        if ($scStart) {
+            $null = sc.exe config $ServiceName start= $scStart 2>&1
+        }
+        return $true
+    }
+    catch {
+        Update-Status "${DisplayName}: Could not repair (continuing...)" -Level WARNING
+        return $false
+    }
+}
+
+function Start-ServiceQuiet {
+    param(
+        [string]$ServiceName,
+        [string]$DisplayName
+    )
+
+    try {
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if (-not $svc) {
+            Update-Status "$ServiceName : Service missing" -Level WARNING
+            return $false
+        }
+        if ($svc.Status -eq 'Running') {
+            Update-Status "${DisplayName}: Already running" -Level SUCCESS
+            return $true
+        }
+
+        Add-UndoEntry -Type 'Service' -Action 'Start' -Target $ServiceName -Before @{ status = [string]$svc.Status } -After @{ status = 'Running' } -Rollback @{ action = 'StopIfOriginallyStopped' } -Status $(if ($Script:IsDryRun) { 'DryRun' } else { 'Applied' }) | Out-Null
+
+        if ($Script:IsDryRun) {
+            Update-Status "[DRY-RUN] Would start service: $DisplayName" -Level INFO
+            [void]$Script:DryRunActions.Add("Start service: $ServiceName")
+            return $true
+        }
+
+        $null = sc.exe start $ServiceName 2>&1
+        Start-Sleep -Milliseconds 500
+        $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq 'Running') {
+            Update-Status "${DisplayName}: Started" -Level SUCCESS
+            return $true
+        }
+
+        Update-Status "${DisplayName}: Could not start (may need reboot)" -Level WARNING
+        return $false
+    }
+    catch {
+        Update-Status "$ServiceName : Error starting (continuing...)" -Level WARNING
         return $false
     }
 }
@@ -1071,35 +1770,15 @@ function Repair-FirewallServices {
     Update-Status "Repairing Firewall Services..." -Level SECTION
 
     foreach ($svc in $Script:FirewallServices) {
-        try {
-            $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)"
-
-            $startValue = switch ($svc.StartType) {
-                'Automatic' { 2 }
-                'Manual' { 3 }
-                'Disabled' { 4 }
-                'Boot' { 0 }
-                'System' { 1 }
-                default { 2 }
-            }
-
-            if ($Script:IsDryRun) {
-                Update-Status "[DRY-RUN] Would set $regPath\Start = $startValue" -Level INFO
-                [void]$Script:DryRunActions.Add("Set $regPath\Start = $startValue")
-                continue
-            }
-
-            if (Test-Path $regPath) {
-                Set-ItemProperty -Path $regPath -Name 'Start' -Value $startValue -Type DWord -Force -ErrorAction SilentlyContinue
-                Update-Status "$($svc.DisplayName): Registry repaired" -Level SUCCESS
-            }
-
-            # Also try sc.exe
-            $null = sc.exe config $svc.Name start= $svc.StartType.ToLower() 2>&1
+        $startValue = switch ($svc.StartType) {
+            'Automatic' { 2 }
+            'Manual' { 3 }
+            'Disabled' { 4 }
+            'Boot' { 0 }
+            'System' { 1 }
+            default { 2 }
         }
-        catch {
-            Update-Status "$($svc.DisplayName): Could not repair (continuing...)" -Level WARNING
-        }
+        Set-ServiceStartValue -ServiceName $svc.Name -DisplayName $svc.DisplayName -StartValue $startValue -StartType $svc.StartType | Out-Null
     }
 }
 
@@ -1123,8 +1802,8 @@ function Repair-FirewallRegistry {
                     [void]$Script:DryRunActions.Add("Remove registry key: $policy")
                 }
                 else {
-                    Remove-Item -Path $policy -Recurse -Force -ErrorAction SilentlyContinue
-                    Update-Status "Removed: $policy" -Level SUCCESS
+                    $backupName = "FirewallPolicy_$($policy -replace '[^A-Za-z0-9]+', '_')"
+                    Remove-RegistryKeyTree -Path $policy -BackupName $backupName -Label $policy | Out-Null
                 }
             }
         }
@@ -1148,7 +1827,7 @@ function Repair-FirewallRegistry {
                     [void]$Script:DryRunActions.Add("Set $profilePath\EnableFirewall = 1")
                 }
                 else {
-                    Set-ItemProperty -Path $profilePath -Name 'EnableFirewall' -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+                    Set-RegistryValue -Path $profilePath -Name 'EnableFirewall' -Value 1 -Type DWord | Out-Null
                 }
             }
         }
@@ -1165,33 +1844,129 @@ function Start-FirewallServices {
     $startOrder = @('BFE', 'mpssvc', 'IKEEXT', 'PolicyAgent')
 
     foreach ($svcName in $startOrder) {
-        try {
-            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-            if ($svc -and $svc.Status -ne 'Running') {
-                if ($Script:IsDryRun) {
-                    Update-Status "[DRY-RUN] Would start service: $($svc.DisplayName)" -Level INFO
-                    [void]$Script:DryRunActions.Add("Start service: $svcName")
-                    continue
-                }
-                Start-Service -Name $svcName -ErrorAction SilentlyContinue
-                Start-Sleep -Milliseconds 500
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        $display = if ($svc) { $svc.DisplayName } else { $svcName }
+        Start-ServiceQuiet -ServiceName $svcName -DisplayName $display | Out-Null
+    }
+}
 
-                $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-                if ($svc.Status -eq 'Running') {
-                    Update-Status "$($svc.DisplayName): Started" -Level SUCCESS
-                }
-                else {
-                    Update-Status "$($svc.DisplayName): Could not start (may need reboot)" -Level WARNING
+function Test-CustomFirewallRule {
+    param([object]$Rule)
+
+    if (-not $Rule) { return $false }
+    if ($Rule.PolicyStoreSourceType -and $Rule.PolicyStoreSourceType -notin @('PersistentStore', 'None')) { return $false }
+    if ($Rule.Group -and $Rule.Group -like '@FirewallAPI.dll,*') { return $false }
+    if ($Rule.DisplayGroup -and $Rule.DisplayGroup -like '@FirewallAPI.dll,*') { return $false }
+    return $true
+}
+
+function Export-CustomFirewallRules {
+    if (-not (Test-PhaseActive 'Features')) { return @() }
+
+    Update-Status "Preserving custom firewall rules..." -Level SECTION
+
+    if ($Script:IsDryRun) {
+        Update-Status "[DRY-RUN] Would export firewall policy and custom rules before reset" -Level INFO
+        [void]$Script:DryRunActions.Add("Export firewall policy and custom rules")
+        return @()
+    }
+
+    Ensure-BackupDirectory | Out-Null
+    $policyPath = Join-Path $Script:Config.BackupPath 'firewall-policy-before-reset.wfw'
+    $rulesPath = Join-Path $Script:Config.BackupPath 'custom-firewall-rules.json'
+    $customRules = @()
+
+    try {
+        $null = netsh advfirewall export "$policyPath" 2>&1
+        Add-UndoEntry -Type 'Firewall' -Action 'ExportPolicyBackup' -Target $policyPath -Before @{ exists = $false } -After @{ exists = (Test-Path -LiteralPath $policyPath) } -Rollback @{ action = 'netsh advfirewall import'; file = $policyPath } -Status 'Applied' | Out-Null
+    }
+    catch {
+        Update-Status "Could not export full firewall policy backup" -Level WARNING
+    }
+
+    try {
+        $rules = Get-NetFirewallRule -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Where-Object { Test-CustomFirewallRule -Rule $_ }
+        foreach ($rule in $rules) {
+            try {
+                $address = $rule | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue
+                $port = $rule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
+                $app = $rule | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
+                $service = $rule | Get-NetFirewallServiceFilter -ErrorAction SilentlyContinue
+
+                $customRules += [ordered]@{
+                    Name          = $rule.Name
+                    DisplayName   = $rule.DisplayName
+                    Description   = $rule.Description
+                    Direction     = [string]$rule.Direction
+                    Action        = [string]$rule.Action
+                    Enabled       = [string]$rule.Enabled
+                    Profile       = [string]$rule.Profile
+                    Program       = if ($app) { [string]$app.Program } else { $null }
+                    Service       = if ($service) { [string]$service.Service } else { $null }
+                    Protocol      = if ($port) { [string]$port.Protocol } else { 'Any' }
+                    LocalPort     = if ($port) { [string]$port.LocalPort } else { 'Any' }
+                    RemotePort    = if ($port) { [string]$port.RemotePort } else { 'Any' }
+                    LocalAddress  = if ($address) { [string]$address.LocalAddress } else { 'Any' }
+                    RemoteAddress = if ($address) { [string]$address.RemoteAddress } else { 'Any' }
                 }
             }
-            elseif ($svc) {
-                Update-Status "$($svc.DisplayName): Already running" -Level SUCCESS
+            catch { }
+        }
+
+        @($customRules) | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $rulesPath -Encoding UTF8
+        Add-UndoEntry -Type 'Firewall' -Action 'ExportCustomRules' -Target $rulesPath -Before @{ count = 0 } -After @{ count = $customRules.Count } -Rollback @{ action = 'RecreateRulesFromJson'; file = $rulesPath } -Status 'Applied' | Out-Null
+        Update-Status "Custom firewall rules exported: $($customRules.Count)" -Level SUCCESS
+    }
+    catch {
+        Update-Status "Could not export custom firewall rules" -Level WARNING
+    }
+
+    return @($customRules)
+}
+
+function Restore-CustomFirewallRules {
+    param([array]$Rules)
+
+    if (-not $Rules -or $Rules.Count -eq 0) {
+        Update-Status "No custom firewall rules to re-import" -Level INFO
+        return
+    }
+
+    Update-Status "Re-importing custom firewall rules..." -Level SECTION
+    $restored = 0
+    foreach ($rule in $Rules) {
+        try {
+            $existing = Get-NetFirewallRule -DisplayName $rule.DisplayName -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($existing) {
+                continue
             }
+
+            $params = @{
+                DisplayName = $rule.DisplayName
+                Direction   = $rule.Direction
+                Action      = $rule.Action
+                Enabled     = $rule.Enabled
+                Profile     = $rule.Profile
+            }
+            if ($rule.Description) { $params.Description = $rule.Description }
+            if ($rule.Program -and $rule.Program -ne 'Any') { $params.Program = $rule.Program }
+            if ($rule.Service -and $rule.Service -ne 'Any') { $params.Service = $rule.Service }
+            if ($rule.Protocol -and $rule.Protocol -ne 'Any') { $params.Protocol = $rule.Protocol }
+            if ($rule.LocalPort -and $rule.LocalPort -ne 'Any') { $params.LocalPort = $rule.LocalPort }
+            if ($rule.RemotePort -and $rule.RemotePort -ne 'Any') { $params.RemotePort = $rule.RemotePort }
+            if ($rule.LocalAddress -and $rule.LocalAddress -ne 'Any') { $params.LocalAddress = $rule.LocalAddress }
+            if ($rule.RemoteAddress -and $rule.RemoteAddress -ne 'Any') { $params.RemoteAddress = $rule.RemoteAddress }
+
+            New-NetFirewallRule @params -ErrorAction Stop | Out-Null
+            Add-UndoEntry -Type 'Firewall' -Action 'RestoreCustomRule' -Target $rule.DisplayName -Before @{ exists = $false } -After @{ exists = $true } -Rollback @{ action = 'Remove-NetFirewallRule'; displayName = $rule.DisplayName } -Status 'Applied' | Out-Null
+            $restored++
         }
         catch {
-            Update-Status "$svcName : Error starting (continuing...)" -Level WARNING
+            Update-Status "Could not re-import firewall rule: $($rule.DisplayName)" -Level WARNING
         }
     }
+
+    Update-Status "Custom firewall rules re-imported: $restored" -Level SUCCESS
 }
 
 function Enable-FirewallProfiles {
@@ -1206,8 +1981,11 @@ function Enable-FirewallProfiles {
         return
     }
 
+    $customRules = Export-CustomFirewallRules
+
     try {
         Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -ErrorAction SilentlyContinue
+        Add-UndoEntry -Type 'Firewall' -Action 'EnableProfiles' -Target 'Domain,Public,Private' -Before @{ enabled = 'Unknown' } -After @{ enabled = $true } -Rollback @{ action = 'ManualReview'; backup = (Join-Path $Script:Config.BackupPath 'firewall-policy-before-reset.wfw') } -Status 'Applied' | Out-Null
         Update-Status "All firewall profiles enabled" -Level SUCCESS
     }
     catch {
@@ -1225,8 +2003,10 @@ function Enable-FirewallProfiles {
 
     # Reset to defaults
     try {
+        Add-UndoEntry -Type 'Firewall' -Action 'ResetPolicy' -Target 'advfirewall' -Before @{ backup = (Join-Path $Script:Config.BackupPath 'firewall-policy-before-reset.wfw') } -After @{ reset = $true } -Rollback @{ action = 'netsh advfirewall import'; file = (Join-Path $Script:Config.BackupPath 'firewall-policy-before-reset.wfw') } -Status 'Applied' | Out-Null
         $null = netsh advfirewall reset 2>&1
         Update-Status "Firewall reset to defaults" -Level SUCCESS
+        Restore-CustomFirewallRules -Rules $customRules
     }
     catch { }
 }
@@ -1240,32 +2020,15 @@ function Repair-DefenderServices {
     Update-Status "Repairing Defender Services..." -Level SECTION
 
     foreach ($svc in $Script:DefenderServices) {
-        try {
-            $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($svc.Name)"
-
-            $startValue = switch ($svc.StartType) {
-                'Automatic' { 2 }
-                'Manual' { 3 }
-                'Disabled' { 4 }
-                'Boot' { 0 }
-                'System' { 1 }
-                default { 3 }
-            }
-
-            if ($Script:IsDryRun) {
-                Update-Status "[DRY-RUN] Would set $regPath\Start = $startValue" -Level INFO
-                [void]$Script:DryRunActions.Add("Set $regPath\Start = $startValue")
-                continue
-            }
-
-            if (Test-Path $regPath) {
-                Set-ItemProperty -Path $regPath -Name 'Start' -Value $startValue -Type DWord -Force -ErrorAction SilentlyContinue
-                Update-Status "$($svc.DisplayName): Registry repaired" -Level SUCCESS
-            }
+        $startValue = switch ($svc.StartType) {
+            'Automatic' { 2 }
+            'Manual' { 3 }
+            'Disabled' { 4 }
+            'Boot' { 0 }
+            'System' { 1 }
+            default { 3 }
         }
-        catch {
-            Update-Status "$($svc.DisplayName): Could not repair (Tamper Protection?)" -Level WARNING
-        }
+        Set-ServiceStartValue -ServiceName $svc.Name -DisplayName $svc.DisplayName -StartValue $startValue -StartType $svc.StartType | Out-Null
     }
 
     # Repair drivers
@@ -1277,15 +2040,7 @@ function Repair-DefenderServices {
 
     foreach ($driver in $drivers) {
         try {
-            $drvPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($driver.Name)"
-            if ($Script:IsDryRun) {
-                Update-Status "[DRY-RUN] Would set $drvPath\Start = $($driver.Start)" -Level INFO
-                [void]$Script:DryRunActions.Add("Set $drvPath\Start = $($driver.Start)")
-                continue
-            }
-            if (Test-Path $drvPath) {
-                Set-ItemProperty -Path $drvPath -Name 'Start' -Value $driver.Start -Type DWord -Force -ErrorAction SilentlyContinue
-            }
+            Set-ServiceStartValue -ServiceName $driver.Name -DisplayName $driver.Name -StartValue $driver.Start -StartType $(if ($driver.Start -eq 0) { 'Boot' } else { 'Manual' }) | Out-Null
         }
         catch { }
     }
@@ -1334,7 +2089,7 @@ function Repair-DefenderRegistry {
                         [void]$Script:DryRunActions.Add("Remove $($item.Path)\$($item.Name)")
                     }
                     else {
-                        Remove-ItemProperty -Path $item.Path -Name $item.Name -Force -ErrorAction SilentlyContinue
+                        Remove-RegistryValue -Path $item.Path -Name $item.Name | Out-Null
                     }
                     $removed++
                 }
@@ -1344,7 +2099,7 @@ function Repair-DefenderRegistry {
             if (-not $Script:IsDryRun) {
                 # Try setting to 0 instead
                 try {
-                    Set-ItemProperty -Path $item.Path -Name $item.Name -Value 0 -Type DWord -Force -ErrorAction SilentlyContinue
+                    Set-RegistryValue -Path $item.Path -Name $item.Name -Value 0 -Type DWord | Out-Null
                 }
                 catch { }
             }
@@ -1367,7 +2122,8 @@ function Repair-DefenderRegistry {
                     [void]$Script:DryRunActions.Add("Remove policy tree: $tree")
                 }
                 else {
-                    Remove-Item -Path $tree -Recurse -Force -ErrorAction SilentlyContinue
+                    $backupName = "DefenderPolicy_$($tree -replace '[^A-Za-z0-9]+', '_')"
+                    Remove-RegistryKeyTree -Path $tree -BackupName $backupName -Label $tree | Out-Null
                 }
             }
         }
@@ -1395,6 +2151,7 @@ function Repair-DefenderScheduledTasks {
                     [void]$Script:DryRunActions.Add("Enable scheduled task: $taskName")
                 }
                 else {
+                    Add-UndoEntry -Type 'ScheduledTask' -Action 'Enable' -Target $taskName -Before @{ state = 'Disabled' } -After @{ state = 'Enabled' } -Rollback @{ action = 'Disable-ScheduledTask'; taskName = $taskName } -Status 'Applied' | Out-Null
                     Enable-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
                     Update-Status "Enabled: $taskName" -Level SUCCESS
                 }
@@ -1421,6 +2178,7 @@ function Repair-DefenderScheduledTasks {
                     [void]$Script:DryRunActions.Add("Remove malicious task: $($task.TaskName)")
                 }
                 else {
+                    Add-UndoEntry -Type 'ScheduledTask' -Action 'Remove' -Target $task.TaskName -Before @{ exists = $true; state = [string]$task.State; path = $task.TaskPath } -After @{ exists = $false } -Rollback @{ action = 'ManualRecreateRequired'; taskName = $task.TaskName; taskPath = $task.TaskPath } -Status 'Applied' | Out-Null
                     Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false -ErrorAction SilentlyContinue
                     Update-Status "Removed malicious task: $($task.TaskName)" -Level SUCCESS
                 }
@@ -1431,23 +2189,308 @@ function Repair-DefenderScheduledTasks {
     catch { }
 }
 
+function Get-DefenderWmiSubscriptions {
+    $subscriptions = @()
+
+    try {
+        $filters = Get-WmiObject -Query "SELECT * FROM __EventFilter WHERE Name LIKE '%Defender%' OR Name LIKE '%WinDefend%' OR Query LIKE '%MsMpEng%' OR Query LIKE '%WinDefend%'" -Namespace 'root\subscription' -ErrorAction SilentlyContinue
+        foreach ($filter in $filters) {
+            $filterRef = "__EventFilter.Name='$($filter.Name)'"
+            $bindings = Get-WmiObject -Query "SELECT * FROM __FilterToConsumerBinding WHERE Filter=""$filterRef""" -Namespace 'root\subscription' -ErrorAction SilentlyContinue
+            $subscriptions += [ordered]@{
+                filter   = $filter
+                bindings = @($bindings)
+            }
+        }
+    }
+    catch { }
+
+    return $subscriptions
+}
+
+function Export-WmiRemovalReport {
+    try {
+        Ensure-BackupDirectory | Out-Null
+        $reportPath = Join-Path $Script:Config.BackupPath 'wmi-subscription-report.json'
+        @($Script:WmiRemovalReport) | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $reportPath -Encoding UTF8
+        $Script:JsonOutput.reports['wmi'] = $reportPath
+        Update-Status "WMI subscription report: $reportPath" -Level SUCCESS
+        return $reportPath
+    }
+    catch {
+        Update-Status "Could not write WMI report: $($_.Exception.Message)" -Level WARNING
+        return $null
+    }
+}
+
+function Get-DefenderControlUndoArtifacts {
+    $roots = @(
+        "$env:USERPROFILE\Desktop",
+        "$env:USERPROFILE\Downloads",
+        "$env:TEMP",
+        "${env:ProgramFiles}\DefenderControl",
+        "${env:ProgramFiles(x86)}\DefenderControl"
+    )
+
+    $artifacts = @()
+    foreach ($root in $roots) {
+        try {
+            if (-not (Test-Path -LiteralPath $root)) { continue }
+
+            $files = Get-ChildItem -LiteralPath $root -File -ErrorAction SilentlyContinue | Where-Object {
+                $_.FullName -match 'dControl|DefenderControl|Defender' -and $_.Name -match 'enable|restore|backup|undo|defender'
+            }
+            foreach ($file in $files) {
+                $artifacts += $file.FullName
+            }
+
+            $candidateDirs = Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Where-Object {
+                $_.Name -match 'dControl|DefenderControl'
+            } | Select-Object -First 5
+            foreach ($dir in $candidateDirs) {
+                $files = Get-ChildItem -LiteralPath $dir.FullName -Recurse -File -ErrorAction SilentlyContinue -Include '*.reg', '*.bak', '*.backup' | Where-Object {
+                    $_.Name -match 'enable|restore|backup|undo|defender'
+                } | Select-Object -First 20
+                foreach ($file in $files) {
+                    $artifacts += $file.FullName
+                }
+            }
+        }
+        catch { }
+    }
+
+    return @($artifacts | Select-Object -Unique)
+}
+
+function Invoke-DefenderControlUndo {
+    if (-not (Test-PhaseActive 'Registry')) { return $false }
+
+    $artifacts = @(Get-DefenderControlUndoArtifacts)
+    if ($artifacts.Count -eq 0) { return $false }
+
+    Update-Status "DefenderControl undo artifacts found: $($artifacts.Count)" -Level SECTION
+    $replayed = 0
+    foreach ($artifact in $artifacts) {
+        try {
+            if ($Script:IsDryRun) {
+                Update-Status "[DRY-RUN] Would replay DefenderControl artifact: $artifact" -Level INFO
+                [void]$Script:DryRunActions.Add("Replay DefenderControl artifact: $artifact")
+                $replayed++
+                continue
+            }
+
+            if ([System.IO.Path]::GetExtension($artifact) -ieq '.reg') {
+                Add-UndoEntry -Type 'DefenderControl' -Action 'ReplayUndoArtifact' -Target $artifact -Before @{ replayed = $false } -After @{ replayed = $true } -Rollback @{ action = 'ManualReview'; source = $artifact } -Status 'Applied' | Out-Null
+                $null = reg import "$artifact" 2>&1
+                Update-Status "Replayed DefenderControl artifact: $artifact" -Level SUCCESS
+                $replayed++
+            }
+        }
+        catch {
+            Update-Status "Could not replay DefenderControl artifact: $artifact" -Level WARNING
+        }
+    }
+
+    return ($replayed -gt 0)
+}
+
+function Get-AppLockerMsMpEngBlockers {
+    $blockers = @()
+    $pattern = 'MsMpEng|WinDefend|Windows Defender|Microsoft Defender|Defender\\Platform'
+
+    try {
+        [xml]$policyXml = Get-AppLockerPolicy -Local -Xml -ErrorAction SilentlyContinue
+        if ($policyXml) {
+            $rules = $policyXml.SelectNodes("//*[local-name()='FilePathRule' or local-name()='FilePublisherRule' or local-name()='FileHashRule']")
+            foreach ($rule in $rules) {
+                if ($rule.Action -eq 'Deny' -and $rule.OuterXml -match $pattern) {
+                    $blockers += [ordered]@{
+                        Source = 'AppLocker'
+                        Name   = $rule.Name
+                        Id     = $rule.Id
+                        Detail = $rule.OuterXml
+                    }
+                }
+            }
+        }
+    }
+    catch { }
+
+    $srpRoots = @(
+        'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers\0\Paths',
+        'HKCU:\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers\0\Paths'
+    )
+    foreach ($root in $srpRoots) {
+        try {
+            if (-not (Test-Path -LiteralPath $root)) { continue }
+            $keys = Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue
+            foreach ($key in $keys) {
+                $item = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+                $itemData = [string]$item.ItemData
+                if ($itemData -match $pattern) {
+                    $providerPath = $key.Name -replace '^HKEY_LOCAL_MACHINE', 'HKLM:' -replace '^HKEY_CURRENT_USER', 'HKCU:'
+                    $blockers += [ordered]@{
+                        Source = 'SRP'
+                        Name   = Split-Path -Leaf $key.Name
+                        Id     = $providerPath
+                        Detail = $itemData
+                    }
+                }
+            }
+        }
+        catch { }
+    }
+
+    return $blockers
+}
+
+function Repair-AppLockerAndSRP {
+    if (-not (Test-PhaseActive 'AppLocker')) { return }
+    Update-Status "Checking AppLocker and SRP Defender blockers..." -Level SECTION
+
+    $blockers = @(Get-AppLockerMsMpEngBlockers)
+    if ($blockers.Count -eq 0) {
+        Update-Status "No AppLocker/SRP Defender blockers found" -Level SUCCESS
+        return
+    }
+
+    Update-Status "Found $($blockers.Count) AppLocker/SRP Defender blocker(s)" -Level WARNING
+
+    try {
+        [xml]$policyXml = Get-AppLockerPolicy -Local -Xml -ErrorAction SilentlyContinue
+        if ($policyXml) {
+            $pattern = 'MsMpEng|WinDefend|Windows Defender|Microsoft Defender|Defender\\Platform'
+            $rules = @($policyXml.SelectNodes("//*[local-name()='FilePathRule' or local-name()='FilePublisherRule' or local-name()='FileHashRule']"))
+            $removedRules = 0
+            foreach ($rule in $rules) {
+                if ($rule.Action -eq 'Deny' -and $rule.OuterXml -match $pattern) {
+                    Update-Status "$(if ($Script:IsDryRun) { '[DRY-RUN] Would remove' } else { 'Removing' }) AppLocker deny rule: $($rule.Name)" -Level WARNING
+                    if ($Script:IsDryRun) {
+                        [void]$Script:DryRunActions.Add("Remove AppLocker deny rule: $($rule.Name)")
+                    }
+                    else {
+                        [void]$rule.ParentNode.RemoveChild($rule)
+                    }
+                    $removedRules++
+                }
+            }
+
+            if ($removedRules -gt 0 -and -not $Script:IsDryRun) {
+                Ensure-BackupDirectory | Out-Null
+                $backupXml = Join-Path $Script:Config.BackupPath 'applocker-policy-before-defender-repair.xml'
+                $newXml = Join-Path $Script:Config.BackupPath 'applocker-policy-after-defender-repair.xml'
+                [xml]$originalXml = Get-AppLockerPolicy -Local -Xml -ErrorAction SilentlyContinue
+                $originalXml.Save($backupXml)
+                $policyXml.Save($newXml)
+                Add-UndoEntry -Type 'AppLocker' -Action 'RemoveDenyRules' -Target 'Local AppLocker Policy' -Before @{ backup = $backupXml; removed = $removedRules } -After @{ policy = $newXml } -Rollback @{ action = 'Set-AppLockerPolicy'; file = $backupXml } -Status 'Applied' | Out-Null
+                Set-AppLockerPolicy -XMLPolicy $newXml -ErrorAction SilentlyContinue
+                Update-Status "AppLocker deny rules removed: $removedRules" -Level SUCCESS
+            }
+        }
+    }
+    catch {
+        Update-Status "Could not repair AppLocker policy (continuing...)" -Level WARNING
+    }
+
+    foreach ($blocker in $blockers | Where-Object { $_.Source -eq 'SRP' }) {
+        try {
+            if ($Script:IsDryRun) {
+                Update-Status "[DRY-RUN] Would remove SRP rule: $($blocker.Detail)" -Level INFO
+                [void]$Script:DryRunActions.Add("Remove SRP rule: $($blocker.Detail)")
+            }
+            else {
+                $backupName = "SRP_$($blocker.Name -replace '[^A-Za-z0-9]+', '_')"
+                Remove-RegistryKeyTree -Path $blocker.Id -BackupName $backupName -Label "SRP rule $($blocker.Detail)" | Out-Null
+            }
+        }
+        catch { }
+    }
+}
+
+function Repair-MDEComponents {
+    if (-not (Test-PhaseActive 'MDE')) { return }
+    Update-Status "Checking Microsoft Defender for Endpoint components..." -Level SECTION
+
+    $isEnterprise = $false
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction SilentlyContinue
+        if ($os.Caption -match 'Enterprise|Education') { $isEnterprise = $true }
+    }
+    catch { }
+
+    foreach ($svc in $Script:MdeServices) {
+        $service = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
+        if (-not $service) {
+            $level = if ($isEnterprise) { 'WARNING' } else { 'INFO' }
+            Update-Status "$($svc.DisplayName): Service not present$(if ($isEnterprise) { ' - MDE onboarding may be missing' } else { '' })" -Level $level
+            continue
+        }
+
+        $start = Get-ServiceStartValue -ServiceName $svc.Name
+        if ($start -eq 4 -or $null -eq $start) {
+            Set-ServiceStartValue -ServiceName $svc.Name -DisplayName $svc.DisplayName -StartValue $svc.StartValue -StartType $svc.StartType | Out-Null
+        }
+        else {
+            Update-Status "$($svc.DisplayName): Start type is not disabled" -Level SUCCESS
+        }
+    }
+}
+
+function Repair-WindowsUpdateServices {
+    if (-not (Test-PhaseActive 'WindowsUpdate')) { return }
+    Update-Status "Repairing Windows Update services used by Defender signatures..." -Level SECTION
+
+    foreach ($svc in $Script:WindowsUpdateServices) {
+        $service = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
+        if (-not $service) {
+            Update-Status "$($svc.DisplayName): Service missing" -Level WARNING
+            continue
+        }
+
+        $start = Get-ServiceStartValue -ServiceName $svc.Name
+        if ($start -eq 4 -or $start -ne $svc.StartValue) {
+            Set-ServiceStartValue -ServiceName $svc.Name -DisplayName $svc.DisplayName -StartValue $svc.StartValue -StartType $svc.StartType | Out-Null
+        }
+        else {
+            Update-Status "$($svc.DisplayName): Start type OK" -Level SUCCESS
+        }
+    }
+
+    foreach ($svcName in @('BITS', 'DoSvc')) {
+        $service = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        if ($service) {
+            Start-ServiceQuiet -ServiceName $svcName -DisplayName $service.DisplayName | Out-Null
+        }
+    }
+}
+
 function Repair-DefenderWMI {
     if (-not (Test-PhaseActive 'WMI')) { return }
     Update-Status "Checking WMI Subscriptions..." -Level SECTION
 
     try {
-        $filters = Get-WmiObject -Query "SELECT * FROM __EventFilter WHERE Name LIKE '%Defender%' OR Name LIKE '%WinDefend%'" -Namespace 'root\subscription' -ErrorAction SilentlyContinue
+        $subscriptions = @(Get-DefenderWmiSubscriptions)
 
-        if ($filters) {
-            foreach ($filter in $filters) {
+        if ($subscriptions.Count -gt 0) {
+            foreach ($sub in $subscriptions) {
+                $filter = $sub.filter
+                [void]$Script:WmiRemovalReport.Add([ordered]@{
+                    name     = $filter.Name
+                    query    = $filter.Query
+                    bindings = @($sub.bindings | ForEach-Object { $_.__RELPATH })
+                    action   = if ($Script:IsDryRun) { 'WouldRemove' } else { 'Removed' }
+                })
+
                 try {
                     if ($Script:IsDryRun) {
                         Update-Status "[DRY-RUN] Would remove WMI subscription: $($filter.Name)" -Level INFO
                         [void]$Script:DryRunActions.Add("Remove WMI subscription: $($filter.Name)")
                     }
                     else {
-                        $bindingQuery = "SELECT * FROM __FilterToConsumerBinding WHERE Filter=""__EventFilter.Name='$($filter.Name)'"""
-                        Get-WmiObject -Query $bindingQuery -Namespace 'root\subscription' -ErrorAction SilentlyContinue | Remove-WmiObject -ErrorAction SilentlyContinue
+                        Add-UndoEntry -Type 'WMI' -Action 'RemoveSubscription' -Target $filter.Name -Before @{ query = $filter.Query; relPath = $filter.__RELPATH; bindings = @($sub.bindings | ForEach-Object { $_.__RELPATH }) } -After @{ exists = $false } -Rollback @{ action = 'ManualRecreateRequired' } -Status 'Applied' | Out-Null
+                        foreach ($binding in $sub.bindings) {
+                            $binding | Remove-WmiObject -ErrorAction SilentlyContinue
+                        }
                         $filter | Remove-WmiObject -ErrorAction SilentlyContinue
                         Update-Status "Removed WMI subscription: $($filter.Name)" -Level SUCCESS
                     }
@@ -1458,6 +2501,8 @@ function Repair-DefenderWMI {
         else {
             Update-Status "No malicious WMI subscriptions found" -Level SUCCESS
         }
+
+        Export-WmiRemovalReport | Out-Null
     }
     catch {
         Update-Status "Could not query WMI (continuing...)" -Level WARNING
@@ -1472,45 +2517,14 @@ function Start-DefenderServices {
     try {
         $secCenter = Get-Service -Name 'wscsvc' -ErrorAction SilentlyContinue
         if ($secCenter -and $secCenter.Status -ne 'Running') {
-            if ($Script:IsDryRun) {
-                Update-Status "[DRY-RUN] Would start Security Center (wscsvc)" -Level INFO
-                [void]$Script:DryRunActions.Add("Start service: wscsvc")
-            }
-            else {
-                Set-Service -Name 'wscsvc' -StartupType Automatic -ErrorAction SilentlyContinue
-                Start-Service -Name 'wscsvc' -ErrorAction SilentlyContinue
-            }
+            Set-ServiceStartValue -ServiceName 'wscsvc' -DisplayName 'Security Center' -StartValue 2 -StartType 'Automatic' | Out-Null
+            Start-ServiceQuiet -ServiceName 'wscsvc' -DisplayName 'Security Center' | Out-Null
         }
     }
     catch { }
 
     foreach ($svc in $Script:DefenderServices) {
-        try {
-            $service = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
-            if ($service -and $service.Status -ne 'Running') {
-                if ($Script:IsDryRun) {
-                    Update-Status "[DRY-RUN] Would start $($svc.DisplayName)" -Level INFO
-                    [void]$Script:DryRunActions.Add("Start service: $($svc.Name)")
-                    continue
-                }
-                Start-Service -Name $svc.Name -ErrorAction SilentlyContinue
-                Start-Sleep -Milliseconds 300
-
-                $service = Get-Service -Name $svc.Name -ErrorAction SilentlyContinue
-                if ($service.Status -eq 'Running') {
-                    Update-Status "$($svc.DisplayName): Started" -Level SUCCESS
-                }
-                else {
-                    Update-Status "$($svc.DisplayName): Could not start (may need reboot)" -Level WARNING
-                }
-            }
-            elseif ($service) {
-                Update-Status "$($svc.DisplayName): Already running" -Level SUCCESS
-            }
-        }
-        catch {
-            Update-Status "$($svc.DisplayName): Error (continuing...)" -Level WARNING
-        }
+        Start-ServiceQuiet -ServiceName $svc.Name -DisplayName $svc.DisplayName | Out-Null
     }
 }
 
@@ -1537,6 +2551,13 @@ function Enable-DefenderFeatures {
     }
 
     try {
+        $beforePrefs = $null
+        try {
+            $beforePrefs = Get-MpPreference -ErrorAction SilentlyContinue | Select-Object DisableRealtimeMonitoring, DisableBehaviorMonitoring, DisableBlockAtFirstSeen, DisableIOAVProtection, DisablePrivacyMode, DisableScriptScanning, DisableArchiveScanning, DisableIntrusionPreventionSystem, MAPSReporting, SubmitSamplesConsent, PUAProtection
+        }
+        catch { }
+        Add-UndoEntry -Type 'DefenderPreference' -Action 'SetProtectionFeatures' -Target 'Set-MpPreference' -Before $beforePrefs -After @{ protectionEnabled = $true } -Rollback @{ action = 'Set-MpPreference'; values = $beforePrefs } -Status 'Applied' | Out-Null
+
         Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
         Set-MpPreference -DisableBehaviorMonitoring $false -ErrorAction SilentlyContinue
         Set-MpPreference -DisableBlockAtFirstSeen $false -ErrorAction SilentlyContinue
@@ -1582,7 +2603,9 @@ function Reset-GroupPolicy {
                 return
             }
             $backupPol = Join-Path $Script:Config.BackupPath "Registry.pol"
+            Ensure-BackupDirectory | Out-Null
             Copy-Item -Path $machinePolPath -Destination $backupPol -Force -ErrorAction SilentlyContinue
+            Add-UndoEntry -Type 'GroupPolicy' -Action 'RemoveRegistryPol' -Target $machinePolPath -Before @{ exists = $true; backup = $backupPol } -After @{ exists = $false } -Rollback @{ action = 'CopyBack'; file = $backupPol } -Status 'Applied' | Out-Null
             Remove-Item -Path $machinePolPath -Force -ErrorAction SilentlyContinue
             Update-Status "Machine policy file removed" -Level SUCCESS
         }
@@ -1610,6 +2633,7 @@ function Repair-WindowsSecurity {
     try {
         $pkg = Get-AppxPackage -Name 'Microsoft.SecHealthUI' -ErrorAction SilentlyContinue
         if ($pkg) {
+            Add-UndoEntry -Type 'Appx' -Action 'RegisterPackage' -Target 'Microsoft.SecHealthUI' -Before @{ installLocation = $pkg.InstallLocation } -After @{ registered = $true } -Rollback @{ action = 'ManualReview' } -Status 'Applied' | Out-Null
             Add-AppxPackage -DisableDevelopmentMode -Register "$($pkg.InstallLocation)\AppXManifest.xml" -ErrorAction SilentlyContinue
             Update-Status "Windows Security app re-registered" -Level SUCCESS
         }
@@ -1617,6 +2641,7 @@ function Repair-WindowsSecurity {
             # Try AllUsers reprovisioning
             $pkg = Get-AppxPackage -AllUsers -Name 'Microsoft.SecHealthUI' -ErrorAction SilentlyContinue
             if ($pkg) {
+                Add-UndoEntry -Type 'Appx' -Action 'RegisterPackage' -Target 'Microsoft.SecHealthUI AllUsers' -Before @{ installLocation = $pkg.InstallLocation } -After @{ registered = $true } -Rollback @{ action = 'ManualReview' } -Status 'Applied' | Out-Null
                 Add-AppxPackage -DisableDevelopmentMode -Register "$($pkg.InstallLocation)\AppXManifest.xml" -ErrorAction SilentlyContinue
                 Update-Status "Windows Security app re-registered (AllUsers)" -Level SUCCESS
             }
@@ -1642,6 +2667,7 @@ function Start-Repair {
     )
 
     $startTime = Get-Date
+    Initialize-UndoManifest
 
     # Capture pre-repair scan
     $Script:PreRepairScan = Get-HealthScan
@@ -1653,6 +2679,8 @@ function Start-Repair {
     # Pre-flight: third-party AV check
     if ($RepairDefender) {
         if (Test-ThirdPartyAVBlocking) {
+            Save-UndoManifest | Out-Null
+            Export-RepairReport | Out-Null
             return $false
         }
     }
@@ -1700,7 +2728,7 @@ function Start-Repair {
         Update-Status "========== FIREWALL REPAIR ==========" -Level SECTION
 
         # Validate dependency tree first
-        Test-FirewallServiceDependencies
+        Test-FirewallServiceDependencies | Out-Null
 
         Repair-FirewallServices
         Repair-FirewallRegistry
@@ -1713,7 +2741,11 @@ function Start-Repair {
         Update-Status ""
         Update-Status "========== DEFENDER REPAIR ==========" -Level SECTION
         Repair-DefenderServices
+        Invoke-DefenderControlUndo | Out-Null
         Repair-DefenderRegistry
+        Repair-AppLockerAndSRP
+        Repair-MDEComponents
+        Repair-WindowsUpdateServices
         Repair-DefenderScheduledTasks
         Repair-DefenderWMI
         Reset-GroupPolicy
@@ -1787,6 +2819,9 @@ function Start-Repair {
         Update-Status "Check Windows Security after restart." -Level INFO
     }
 
+    Save-UndoManifest | Out-Null
+    Export-RepairReport | Out-Null
+
     return $true
 }
 
@@ -1794,18 +2829,39 @@ function Start-Repair {
 # CLI ENTRY POINT
 # ============================================================================
 
+if ($Script:IsWorker) {
+    return
+}
+
 function Invoke-CliStatus {
     <#
     .SYNOPSIS
         CLI Status mode: show health scan, detected privacy tools, and policy audit.
     #>
-    $scan = Get-HealthScan
+    $snapshot = New-StatusSnapshot
+    $scan = $snapshot.scan
+    $diff = $null
+    if ($CompareSnapshot) {
+        try {
+            $previous = Get-Content -LiteralPath $CompareSnapshot -Raw -ErrorAction Stop | ConvertFrom-Json
+            $diff = Compare-StatusSnapshot -Previous $previous -Current $snapshot
+        }
+        catch {
+            Write-Warning "Could not compare snapshot: $($_.Exception.Message)"
+        }
+    }
+    if ($SnapshotPath) {
+        $snapshotSaved = Save-StatusSnapshot -Snapshot $snapshot -Path $SnapshotPath
+    }
 
     if ($Script:IsJson) {
-        $Script:JsonOutput.preScan = $scan
-        $Script:JsonOutput.privacyTools = @(Get-DetectedPrivacyTools)
-        $Script:JsonOutput.blockers = @(Get-PolicySourceAudit)
-        $Script:JsonOutput.thirdPartyAV = Get-ThirdPartyAV
+        $Script:JsonOutput.preScan = $snapshot.scan
+        $Script:JsonOutput.privacyTools = $snapshot.privacyTools
+        $Script:JsonOutput.blockers = $snapshot.blockers
+        $Script:JsonOutput.thirdPartyAV = $snapshot.thirdPartyAV
+        $Script:JsonOutput.avGuidance = $snapshot.avGuidance
+        $Script:JsonOutput.snapshotPath = $SnapshotPath
+        $Script:JsonOutput.diff = $diff
         $Script:JsonOutput.exitCode = 0
         Write-Output ($Script:JsonOutput | ConvertTo-Json -Depth 5)
         exit 0
@@ -1823,14 +2879,18 @@ function Invoke-CliStatus {
         @{ Label = 'Firewall (MpsSvc)'; Value = $scan['MpsSvc'] },
         @{ Label = 'Real-Time Protection'; Value = $scan['RealTimeProtection'] },
         @{ Label = 'Tamper Protection'; Value = $scan['TamperProtection'] },
+        @{ Label = 'SmartScreen'; Value = $scan['SmartScreen'] },
         @{ Label = 'Definition Age'; Value = if ($scan['DefinitionAge'] -ge 0) { "$($scan['DefinitionAge']) days" } else { 'Unknown' } },
         @{ Label = 'Group Policy Blocking'; Value = $scan['GroupPolicyBlocking'] },
-        @{ Label = 'Windows Security App'; Value = $scan['WindowsSecurityApp'] }
+        @{ Label = 'Windows Security App'; Value = $scan['WindowsSecurityApp'] },
+        @{ Label = 'MDE Sense'; Value = $scan['MDE'] },
+        @{ Label = 'Third-Party AV'; Value = $scan['ThirdPartyAV'] }
     )
 
     foreach ($c in $components) {
         $color = 'Green'
-        if ($c.Value -in @('OFF', 'Missing', 'Disabled', 'Yes', 'Unknown')) { $color = 'Red' }
+        if ($c.Label -eq 'Third-Party AV' -and $c.Value -ne 'None') { $color = 'Red' }
+        elseif ($c.Value -in @('OFF', 'Missing', 'Disabled', 'Yes', 'Unknown')) { $color = 'Red' }
         elseif ($c.Value -in @('Stopped')) { $color = 'Yellow' }
         Write-Host ("{0,-26} " -f $c.Label) -NoNewline
         Write-Host $c.Value -ForegroundColor $color
@@ -1838,17 +2898,20 @@ function Invoke-CliStatus {
 
     # Third-party AV
     Write-Host ''
-    $avList = Get-ThirdPartyAV
+    $avList = $snapshot.thirdPartyAV
     if ($avList) {
         Write-Host 'Third-Party AV Detected:' -ForegroundColor Yellow
         foreach ($av in $avList) {
             Write-Host "  - $($av.Name)" -ForegroundColor Yellow
         }
+        foreach ($hint in $snapshot.avGuidance) {
+            Write-Host "    $($hint.guidance)" -ForegroundColor Yellow
+        }
     }
 
     # Privacy tools
     Write-Host ''
-    $privacyTools = Get-DetectedPrivacyTools
+    $privacyTools = $snapshot.privacyTools
     if ($privacyTools -and $privacyTools.Count -gt 0) {
         Write-Host 'Detected Privacy Tools:' -ForegroundColor Yellow
         foreach ($pt in $privacyTools) {
@@ -1858,7 +2921,7 @@ function Invoke-CliStatus {
 
     # Policy audit
     Write-Host ''
-    $blockers = Get-PolicySourceAudit
+    $blockers = $snapshot.blockers
     if ($blockers -and $blockers.Count -gt 0) {
         Write-Host "Active Blockers ($($blockers.Count)):" -ForegroundColor Red
         Write-Host ("{0,-20} {1,-45} {2}" -f 'SOURCE', 'LABEL', 'DETAIL') -ForegroundColor Cyan
@@ -1871,6 +2934,19 @@ function Invoke-CliStatus {
     }
 
     Write-Host ''
+    if ($SnapshotPath) {
+        if ($snapshotSaved -and (Test-Path -LiteralPath $SnapshotPath)) {
+            Write-Host "Snapshot saved: $SnapshotPath" -ForegroundColor Green
+        }
+        else {
+            Write-Warning "Snapshot was not saved: $SnapshotPath"
+        }
+    }
+    if ($diff) {
+        Show-StatusDiff -Diff $diff
+        Write-Host ''
+    }
+
     $defBroken = Test-DefenderBroken -Scan $scan
     $fwBroken = Test-FirewallBroken -Scan $scan
     if ($defBroken -or $fwBroken) {
@@ -1885,7 +2961,20 @@ function Invoke-CliStatus {
 
 # CLI dispatch
 if ($Script:CliMode) {
-    if ($Mode -eq 'Status') {
+    if ($InstallWatchdog) {
+        Install-WatchdogTask
+    }
+    elseif ($RemoveWatchdog) {
+        Remove-WatchdogTask
+    }
+    elseif ($WatchdogCheck) {
+        Invoke-WatchdogCheck
+    }
+    elseif ($ComputerName -and $ComputerName.Count -gt 0) {
+        if (-not $Mode) { $Mode = 'Status' }
+        Invoke-FleetRepair -Targets $ComputerName
+    }
+    elseif ($Mode -eq 'Status') {
         Invoke-CliStatus
     }
     else {
@@ -1914,10 +3003,10 @@ if ($Script:CliMode) {
 <Window
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Title="DefenderShield v3.0.0 - Windows Security Repair Tool"
-    Height="900" Width="740"
+    Title="DefenderShield v3.1.0 - Windows Security Repair Tool"
+    Height="940" Width="860"
     WindowStartupLocation="CenterScreen"
-    ResizeMode="CanMinimize"
+    ResizeMode="CanResize"
     Background="#1e1e2e">
 
     <Window.Resources>
@@ -1948,6 +3037,7 @@ if ($Script:CliMode) {
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
@@ -1955,72 +3045,45 @@ if ($Script:CliMode) {
         <!-- Header -->
         <StackPanel Grid.Row="0" Margin="0,0,0,15">
             <TextBlock Text="DefenderShield" FontSize="28" FontWeight="Bold" Foreground="#f38ba8" HorizontalAlignment="Center"/>
-            <TextBlock Text="Windows Defender and Firewall Repair Tool  v3.0.0" FontSize="14" Foreground="#a6adc8" HorizontalAlignment="Center" Margin="0,5,0,0"/>
+            <TextBlock Text="Windows Defender and Firewall Repair Tool  v3.1.0" FontSize="14" Foreground="#a6adc8" HorizontalAlignment="Center" Margin="0,5,0,0"/>
         </StackPanel>
 
         <!-- Health Dashboard -->
-        <Border Grid.Row="1" Background="#181825" CornerRadius="8" Padding="15" Margin="0,0,0,10">
-            <StackPanel>
-                <TextBlock Text="System Health Dashboard" FontSize="16" FontWeight="SemiBold" Foreground="#cdd6f4" Margin="0,0,0,10"/>
-                <Grid>
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="*"/>
-                    </Grid.ColumnDefinitions>
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto"/>
-                        <RowDefinition Height="Auto"/>
-                        <RowDefinition Height="Auto"/>
-                        <RowDefinition Height="Auto"/>
-                        <RowDefinition Height="Auto"/>
-                    </Grid.RowDefinitions>
-
-                    <!-- Left column -->
-                    <StackPanel Grid.Row="0" Grid.Column="0" Orientation="Horizontal" Margin="0,3">
-                        <TextBlock Text="WinDefend:  " Foreground="#a6adc8" FontFamily="Consolas" FontSize="12"/>
-                        <TextBlock x:Name="lblWinDefend" Text="Scanning..." Foreground="#6c7086" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
+        <StackPanel Grid.Row="1" Margin="0,0,0,10">
+            <TextBlock Text="System Health Dashboard" FontSize="16" FontWeight="SemiBold" Foreground="#cdd6f4" Margin="0,0,0,10"/>
+            <UniformGrid Columns="5">
+                <Border Background="#181825" CornerRadius="8" Padding="12" Margin="0,0,8,0" MinHeight="82">
+                    <StackPanel>
+                        <TextBlock Text="Defender" Foreground="#a6adc8" FontSize="12"/>
+                        <TextBlock x:Name="lblTileDefenderStatus" Text="Scanning..." Foreground="#6c7086" FontSize="18" FontWeight="Bold" TextWrapping="Wrap"/>
                     </StackPanel>
-                    <StackPanel Grid.Row="1" Grid.Column="0" Orientation="Horizontal" Margin="0,3">
-                        <TextBlock Text="SecurityHealth:  " Foreground="#a6adc8" FontFamily="Consolas" FontSize="12"/>
-                        <TextBlock x:Name="lblSecHealth" Text="Scanning..." Foreground="#6c7086" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
+                </Border>
+                <Border Background="#181825" CornerRadius="8" Padding="12" Margin="0,0,8,0" MinHeight="82">
+                    <StackPanel>
+                        <TextBlock Text="Firewall" Foreground="#a6adc8" FontSize="12"/>
+                        <TextBlock x:Name="lblTileFirewallStatus" Text="Scanning..." Foreground="#6c7086" FontSize="18" FontWeight="Bold" TextWrapping="Wrap"/>
                     </StackPanel>
-                    <StackPanel Grid.Row="2" Grid.Column="0" Orientation="Horizontal" Margin="0,3">
-                        <TextBlock Text="Security Center:  " Foreground="#a6adc8" FontFamily="Consolas" FontSize="12"/>
-                        <TextBlock x:Name="lblWscsvc" Text="Scanning..." Foreground="#6c7086" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
+                </Border>
+                <Border Background="#181825" CornerRadius="8" Padding="12" Margin="0,0,8,0" MinHeight="82">
+                    <StackPanel>
+                        <TextBlock Text="Tamper" Foreground="#a6adc8" FontSize="12"/>
+                        <TextBlock x:Name="lblTileTamperStatus" Text="Scanning..." Foreground="#6c7086" FontSize="18" FontWeight="Bold" TextWrapping="Wrap"/>
                     </StackPanel>
-                    <StackPanel Grid.Row="3" Grid.Column="0" Orientation="Horizontal" Margin="0,3">
-                        <TextBlock Text="Firewall (MpsSvc):  " Foreground="#a6adc8" FontFamily="Consolas" FontSize="12"/>
-                        <TextBlock x:Name="lblMpsSvc" Text="Scanning..." Foreground="#6c7086" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
+                </Border>
+                <Border Background="#181825" CornerRadius="8" Padding="12" Margin="0,0,8,0" MinHeight="82">
+                    <StackPanel>
+                        <TextBlock Text="Signature Age" Foreground="#a6adc8" FontSize="12"/>
+                        <TextBlock x:Name="lblTileSignatureStatus" Text="Scanning..." Foreground="#6c7086" FontSize="18" FontWeight="Bold" TextWrapping="Wrap"/>
                     </StackPanel>
-                    <StackPanel Grid.Row="4" Grid.Column="0" Orientation="Horizontal" Margin="0,3">
-                        <TextBlock Text="Win Security App:  " Foreground="#a6adc8" FontFamily="Consolas" FontSize="12"/>
-                        <TextBlock x:Name="lblWinSecApp" Text="Scanning..." Foreground="#6c7086" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
+                </Border>
+                <Border Background="#181825" CornerRadius="8" Padding="12" MinHeight="82">
+                    <StackPanel>
+                        <TextBlock Text="Third-Party AV" Foreground="#a6adc8" FontSize="12"/>
+                        <TextBlock x:Name="lblTileAvStatus" Text="Scanning..." Foreground="#6c7086" FontSize="16" FontWeight="Bold" TextWrapping="Wrap"/>
                     </StackPanel>
-
-                    <!-- Right column -->
-                    <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" Margin="0,3">
-                        <TextBlock Text="Real-Time Protection:  " Foreground="#a6adc8" FontFamily="Consolas" FontSize="12"/>
-                        <TextBlock x:Name="lblRTP" Text="Scanning..." Foreground="#6c7086" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
-                    </StackPanel>
-                    <StackPanel Grid.Row="1" Grid.Column="1" Orientation="Horizontal" Margin="0,3">
-                        <TextBlock Text="Tamper Protection:  " Foreground="#a6adc8" FontFamily="Consolas" FontSize="12"/>
-                        <TextBlock x:Name="lblTamper" Text="Scanning..." Foreground="#6c7086" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
-                    </StackPanel>
-                    <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" Margin="0,3">
-                        <TextBlock Text="SmartScreen:  " Foreground="#a6adc8" FontFamily="Consolas" FontSize="12"/>
-                        <TextBlock x:Name="lblSmartScreen" Text="Scanning..." Foreground="#6c7086" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
-                    </StackPanel>
-                    <StackPanel Grid.Row="3" Grid.Column="1" Orientation="Horizontal" Margin="0,3">
-                        <TextBlock Text="Definition Age:  " Foreground="#a6adc8" FontFamily="Consolas" FontSize="12"/>
-                        <TextBlock x:Name="lblDefAge" Text="Scanning..." Foreground="#6c7086" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
-                    </StackPanel>
-                    <StackPanel Grid.Row="4" Grid.Column="1" Orientation="Horizontal" Margin="0,3">
-                        <TextBlock Text="GP Blocking:  " Foreground="#a6adc8" FontFamily="Consolas" FontSize="12"/>
-                        <TextBlock x:Name="lblGPBlock" Text="Scanning..." Foreground="#6c7086" FontFamily="Consolas" FontSize="12" FontWeight="Bold"/>
-                    </StackPanel>
-                </Grid>
-            </StackPanel>
-        </Border>
+                </Border>
+            </UniformGrid>
+        </StackPanel>
 
         <!-- Options Panel -->
         <Border Grid.Row="2" Background="#181825" CornerRadius="8" Padding="20" Margin="0,0,0,10">
@@ -2070,28 +3133,49 @@ if ($Script:CliMode) {
             </Grid>
         </Border>
 
+        <ProgressBar x:Name="prgRepair" Grid.Row="4" Height="8" Margin="0,0,0,10" IsIndeterminate="True" Visibility="Collapsed" Background="#313244" Foreground="#89b4fa"/>
+
         <!-- Status Output -->
-        <Border Grid.Row="4" Background="#11111b" CornerRadius="8" Padding="10">
-            <RichTextBox x:Name="txtStatus"
-                         Background="Transparent"
-                         Foreground="#cdd6f4"
-                         FontFamily="Consolas"
-                         FontSize="12"
-                         IsReadOnly="True"
-                         BorderThickness="0"
-                         VerticalScrollBarVisibility="Auto">
-                <FlowDocument>
-                    <Paragraph>
-                        <Run Foreground="#6c7086">Ready. Select options above and click Start Repair.</Run>
-                    </Paragraph>
-                </FlowDocument>
-            </RichTextBox>
-        </Border>
+        <TabControl Grid.Row="5" Background="#11111b" BorderBrush="#45475a" Foreground="#cdd6f4">
+            <TabItem Header="Live Log" Background="#181825" Foreground="#cdd6f4">
+                <Border Background="#11111b" Padding="10">
+                    <RichTextBox x:Name="txtStatus"
+                                 Background="Transparent"
+                                 Foreground="#cdd6f4"
+                                 FontFamily="Consolas"
+                                 FontSize="12"
+                                 IsReadOnly="True"
+                                 BorderThickness="0"
+                                 VerticalScrollBarVisibility="Auto">
+                        <FlowDocument>
+                            <Paragraph>
+                                <Run Foreground="#6c7086">Ready. Select options above and click Start Repair.</Run>
+                            </Paragraph>
+                        </FlowDocument>
+                    </RichTextBox>
+                </Border>
+            </TabItem>
+            <TabItem Header="Report" Background="#181825" Foreground="#cdd6f4">
+                <Border Background="#11111b" Padding="10">
+                    <TextBox x:Name="txtReport"
+                             Text="No report has been generated yet."
+                             Background="Transparent"
+                             Foreground="#cdd6f4"
+                             FontFamily="Consolas"
+                             FontSize="12"
+                             IsReadOnly="True"
+                             BorderThickness="0"
+                             TextWrapping="Wrap"
+                             VerticalScrollBarVisibility="Auto"/>
+                </Border>
+            </TabItem>
+        </TabControl>
 
         <!-- Buttons -->
-        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,15,0,0">
+        <StackPanel Grid.Row="6" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,15,0,0">
             <Button x:Name="btnQuickFix" Content="Quick Fix All" Margin="0,0,10,0" Width="150" Background="#f38ba8" Foreground="#1e1e2e"/>
             <Button x:Name="btnStart" Content="Start Repair" Margin="0,0,10,0" Width="150"/>
+            <Button x:Name="btnExportReport" Content="Open Report" Margin="0,0,10,0" Width="140" Background="#94e2d5" Foreground="#1e1e2e" IsEnabled="False"/>
             <Button x:Name="btnRestart" Content="Restart PC" Width="120" Background="#45475a" Foreground="#cdd6f4" IsEnabled="False"/>
         </StackPanel>
     </Grid>
@@ -2107,33 +3191,128 @@ $chkFirewall = $window.FindName('chkFirewall')
 $chkDefender = $window.FindName('chkDefender')
 $chkRestorePoint = $window.FindName('chkRestorePoint')
 $txtStatus = $window.FindName('txtStatus')
+$txtReport = $window.FindName('txtReport')
+$prgRepair = $window.FindName('prgRepair')
 $btnStart = $window.FindName('btnStart')
 $btnRestart = $window.FindName('btnRestart')
 $btnQuickFix = $window.FindName('btnQuickFix')
+$btnExportReport = $window.FindName('btnExportReport')
 $btnTamperHelper = $window.FindName('btnTamperHelper')
 $btnTamperRecheck = $window.FindName('btnTamperRecheck')
 
 # Dashboard labels
 $Script:DashboardLabels = @{
-    'lblWinDefend'   = $window.FindName('lblWinDefend')
-    'lblSecHealth'   = $window.FindName('lblSecHealth')
-    'lblWscsvc'      = $window.FindName('lblWscsvc')
-    'lblMpsSvc'      = $window.FindName('lblMpsSvc')
-    'lblRTP'         = $window.FindName('lblRTP')
-    'lblTamper'      = $window.FindName('lblTamper')
-    'lblSmartScreen' = $window.FindName('lblSmartScreen')
-    'lblDefAge'      = $window.FindName('lblDefAge')
-    'lblGPBlock'     = $window.FindName('lblGPBlock')
-    'lblWinSecApp'   = $window.FindName('lblWinSecApp')
+    'lblTileDefenderStatus'  = $window.FindName('lblTileDefenderStatus')
+    'lblTileFirewallStatus'  = $window.FindName('lblTileFirewallStatus')
+    'lblTileTamperStatus'    = $window.FindName('lblTileTamperStatus')
+    'lblTileSignatureStatus' = $window.FindName('lblTileSignatureStatus')
+    'lblTileAvStatus'        = $window.FindName('lblTileAvStatus')
+    'lblWinDefend'           = $window.FindName('lblWinDefend')
+    'lblSecHealth'           = $window.FindName('lblSecHealth')
+    'lblWscsvc'              = $window.FindName('lblWscsvc')
+    'lblMpsSvc'              = $window.FindName('lblMpsSvc')
+    'lblRTP'                 = $window.FindName('lblRTP')
+    'lblTamper'              = $window.FindName('lblTamper')
+    'lblSmartScreen'         = $window.FindName('lblSmartScreen')
+    'lblDefAge'              = $window.FindName('lblDefAge')
+    'lblGPBlock'             = $window.FindName('lblGPBlock')
+    'lblWinSecApp'           = $window.FindName('lblWinSecApp')
 }
 
 # Store reference for logging
 $Script:StatusTextBox = $txtStatus
+$Script:RepairPowerShell = $null
+$Script:RepairAsync = $null
+$Script:RepairTimer = $null
+$Script:RepairLogPosition = 0
+$Script:ActiveRepairLogPath = $null
+$Script:ActiveRepairReportPath = $null
+$Script:ActiveRepairBackupPath = $null
+
+function Read-GuiRepairLog {
+    if (-not $Script:ActiveRepairLogPath) { return }
+    if (-not (Test-Path -LiteralPath $Script:ActiveRepairLogPath)) { return }
+
+    try {
+        $fs = [System.IO.File]::Open($Script:ActiveRepairLogPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $null = $fs.Seek($Script:RepairLogPosition, [System.IO.SeekOrigin]::Begin)
+            $reader = New-Object System.IO.StreamReader($fs)
+            $text = $reader.ReadToEnd()
+            $Script:RepairLogPosition = $fs.Position
+        }
+        finally {
+            $fs.Close()
+        }
+
+        foreach ($line in ($text -split "`r?`n")) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $level = 'INFO'
+            $message = $line
+            if ($line -match '^\[[^\]]+\]\s+\[([^\]]+)\]\s+(.*)$') {
+                $level = $Matches[1]
+                $message = $Matches[2]
+            }
+            Add-GuiStatusLine -Message $message -Level $level
+        }
+    }
+    catch { }
+}
+
+function Complete-GuiRepair {
+    Read-GuiRepairLog
+
+    try {
+        if ($Script:RepairPowerShell -and $Script:RepairAsync) {
+            $null = $Script:RepairPowerShell.EndInvoke($Script:RepairAsync)
+            if ($Script:RepairPowerShell.Streams.Error.Count -gt 0) {
+                foreach ($err in $Script:RepairPowerShell.Streams.Error) {
+                    Add-GuiStatusLine -Message "Worker error: $($err.Exception.Message)" -Level ERROR
+                }
+            }
+        }
+    }
+    catch {
+        Add-GuiStatusLine -Message "Repair worker failed: $($_.Exception.Message)" -Level ERROR
+    }
+    finally {
+        if ($Script:RepairPowerShell) {
+            $Script:RepairPowerShell.Dispose()
+        }
+        $Script:RepairPowerShell = $null
+        $Script:RepairAsync = $null
+    }
+
+    $prgRepair.Visibility = 'Collapsed'
+    $btnStart.Content = "Start Repair"
+    $btnQuickFix.Content = "Quick Fix All"
+    $btnStart.IsEnabled = $true
+    $btnQuickFix.IsEnabled = $true
+    $btnRestart.IsEnabled = $true
+    $chkFirewall.IsEnabled = $true
+    $chkDefender.IsEnabled = $true
+    $chkRestorePoint.IsEnabled = $true
+
+    try {
+        $scan = Get-HealthScan
+        Update-HealthDashboard -Scan $scan
+    }
+    catch { }
+
+    $manifestPath = Join-Path $Script:ActiveRepairBackupPath 'undo-manifest.json'
+    if (Test-Path -LiteralPath $Script:ActiveRepairReportPath) {
+        $btnExportReport.IsEnabled = $true
+        $txtReport.Text = "Report generated:`r`n$($Script:ActiveRepairReportPath)`r`n`r`nUndo manifest:`r`n$manifestPath`r`n`r`nLog:`r`n$($Script:ActiveRepairLogPath)"
+    }
+    else {
+        $txtReport.Text = "Repair completed, but no HTML report was generated.`r`nLog:`r`n$($Script:ActiveRepairLogPath)"
+    }
+}
 
 # Helper to run repair with current checkbox state
 $Script:RunRepair = {
     if (-not $chkFirewall.IsChecked -and -not $chkDefender.IsChecked) {
-        [System.Windows.MessageBox]::Show("Please select at least one component to repair.", "DefenderShield", "OK", "Warning") | Out-Null
+        Update-Status "Select at least one component to repair." -Level WARNING
         return
     }
 
@@ -2143,32 +3322,60 @@ $Script:RunRepair = {
     # Disable controls during repair
     $btnStart.IsEnabled = $false
     $btnQuickFix.IsEnabled = $false
+    $btnExportReport.IsEnabled = $false
     $chkFirewall.IsEnabled = $false
     $chkDefender.IsEnabled = $false
     $chkRestorePoint.IsEnabled = $false
     $btnStart.Content = "Repairing..."
     $btnQuickFix.Content = "Repairing..."
+    $prgRepair.Visibility = 'Visible'
 
     # Store selections
-    $repairFW = $chkFirewall.IsChecked
-    $repairDef = $chkDefender.IsChecked
-    $createRP = $chkRestorePoint.IsChecked
+    $repairFW = [bool]$chkFirewall.IsChecked
+    $repairDef = [bool]$chkDefender.IsChecked
+    $createRP = [bool]$chkRestorePoint.IsChecked
 
-    # Process UI events then run repair
-    [System.Windows.Forms.Application]::DoEvents()
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $Script:ActiveRepairLogPath = "$env:USERPROFILE\Desktop\DefenderShield_$stamp.log"
+    $Script:ActiveRepairBackupPath = "$env:USERPROFILE\Desktop\DefenderShield_Backup_$stamp"
+    $Script:ActiveRepairReportPath = "$env:USERPROFILE\Desktop\DefenderShield_Report_$stamp.html"
+    $Script:RepairLogPosition = 0
+    $txtReport.Text = "Repair running...`r`nLog:`r`n$($Script:ActiveRepairLogPath)"
 
-    # Run repair
-    Start-Repair -RepairFirewall $repairFW -RepairDefender $repairDef -CreateRestorePoint $createRP
+    $workerScript = @'
+param($scriptPath, $repairFW, $repairDef, $createRP, $logPath, $backupPath, $reportPath)
+. $scriptPath -Worker -WorkerLogPath $logPath -WorkerBackupPath $backupPath -WorkerReportPath $reportPath
+Start-Repair -RepairFirewall $repairFW -RepairDefender $repairDef -CreateRestorePoint $createRP | Out-Null
+$Script:ExitCode
+'@
 
-    # Re-enable controls
-    $btnStart.Content = "Start Repair"
-    $btnQuickFix.Content = "Quick Fix All"
-    $btnStart.IsEnabled = $true
-    $btnQuickFix.IsEnabled = $true
-    $btnRestart.IsEnabled = $true
-    $chkFirewall.IsEnabled = $true
-    $chkDefender.IsEnabled = $true
-    $chkRestorePoint.IsEnabled = $true
+    try {
+        $Script:RepairPowerShell = [PowerShell]::Create()
+        $workerCommand = $Script:RepairPowerShell.AddScript($workerScript)
+        [void]$workerCommand.AddArgument($PSCommandPath)
+        [void]$workerCommand.AddArgument($repairFW)
+        [void]$workerCommand.AddArgument($repairDef)
+        [void]$workerCommand.AddArgument($createRP)
+        [void]$workerCommand.AddArgument($Script:ActiveRepairLogPath)
+        [void]$workerCommand.AddArgument($Script:ActiveRepairBackupPath)
+        [void]$workerCommand.AddArgument($Script:ActiveRepairReportPath)
+        $Script:RepairAsync = $Script:RepairPowerShell.BeginInvoke()
+
+        $Script:RepairTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $Script:RepairTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+        $Script:RepairTimer.Add_Tick({
+            Read-GuiRepairLog
+            if ($Script:RepairAsync -and $Script:RepairAsync.IsCompleted) {
+                $Script:RepairTimer.Stop()
+                Complete-GuiRepair
+            }
+        })
+        $Script:RepairTimer.Start()
+    }
+    catch {
+        Add-GuiStatusLine -Message "Could not start repair worker: $($_.Exception.Message)" -Level ERROR
+        Complete-GuiRepair
+    }
 }
 
 # Start button click
@@ -2196,9 +3403,17 @@ $btnQuickFix.Add_Click({
 
 # Restart button click
 $btnRestart.Add_Click({
-    $result = [System.Windows.MessageBox]::Show("Are you sure you want to restart your computer now?", "Restart Computer", "YesNo", "Question")
-    if ($result -eq 'Yes') {
-        Restart-Computer -Force
+    Update-Status "Restart requested. Restarting now..." -Level WARNING
+    Restart-Computer -Force
+})
+
+# Open report button click
+$btnExportReport.Add_Click({
+    if ($Script:ActiveRepairReportPath -and (Test-Path -LiteralPath $Script:ActiveRepairReportPath)) {
+        Start-Process $Script:ActiveRepairReportPath
+    }
+    else {
+        Update-Status "No report is available yet." -Level WARNING
     }
 })
 
